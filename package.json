@@ -1,0 +1,37 @@
+{
+  "name": "charon",
+  "version": "0.1.0",
+  "description": "Autonomous TRON USDT payment relay powered by WDK and OpenClaw",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "fastify": "^4.0.0",
+    "@fastify/cors": "^8.0.0",
+    "x402": "^1.1.0",
+    "@coinbase/x402": "^2.1.0",
+    "tronweb": "^5.0.0",
+    "ethers": "^6.0.0",
+    "better-sqlite3": "^9.0.0",
+    "node-cron": "^3.0.0",
+    "axios": "^1.0.0",
+    "dotenv": "^16.0.0",
+    "uuid": "^9.0.0",
+    "zod": "^3.0.0",
+    "@cosmjs/proto-signing": "^0.32.0",
+    "@cosmjs/stargate": "^0.32.0",
+    "@akashnetwork/chain-sdk": "^1.0.0-alpha.25",
+    "long": "^5.2.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "ts-node": "^10.0.0",
+    "@types/node": "^20.0.0",
+    "@types/better-sqlite3": "^7.0.0",
+    "@types/node-cron": "^3.0.0",
+    "@types/uuid": "^9.0.0"
+  }
+}

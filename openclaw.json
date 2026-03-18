@@ -1,0 +1,47 @@
+{
+  "version": "1",
+  "models": {
+    "primary": "anthropic/claude-opus-4-6",
+    "fallback": "anthropic/claude-sonnet-4-6"
+  },
+  "thinking": {
+    "mode": "adaptive"
+  },
+  "cache": {
+    "retention": "long"
+  },
+  "agents": [
+    {
+      "name": "main",
+      "default": true,
+      "description": "General-purpose agent session. Used for ad-hoc reasoning and anomaly handling.",
+      "instructions": "AGENTS.md",
+      "memory": "MEMORY.md",
+      "soul": "SOUL.md",
+      "skills": ["relay-ops"]
+    },
+    {
+      "name": "board-meeting",
+      "description": "Daily planning session. Receives full financial context and produces a strategic assessment plus a prioritised action list. Expected to call tools during the session.",
+      "instructions": "AGENTS.md",
+      "memory": "MEMORY.md",
+      "soul": "SOUL.md",
+      "skills": ["relay-ops"],
+      "thinking": {
+        "mode": "high"
+      }
+    },
+    {
+      "name": "decision",
+      "description": "Short-lived event-triggered session for a single focused decision (anomaly handling, experiment evaluation, pricing review). Receives a pre-assembled context object and must produce a structured JSON response.",
+      "instructions": "AGENTS.md",
+      "memory": "MEMORY.md",
+      "soul": "SOUL.md",
+      "skills": ["relay-ops"],
+      "thinking": {
+        "mode": "adaptive"
+      },
+      "responseFormat": "json"
+    }
+  ]
+}

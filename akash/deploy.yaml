@@ -1,0 +1,137 @@
+# akash/deploy.yaml — Akash Network Deployment Specification (SDL)
+#
+# This is the "bid document" submitted to the Akash provider marketplace.
+# Independent providers around the world bid on this spec; you pick the
+# cheapest acceptable bid and pay with AKT from your Akash escrow wallet.
+#
+# ── How to deploy ────────────────────────────────────────────────────────────
+# 1. Install the Akash CLI:
+#      curl https://raw.githubusercontent.com/akash-network/node/master/install.sh | sh
+#
+# 2. Set your wallet key:
+#      akash keys add relay-key --recover   # enter WDK_SEED_PHRASE when prompted
+#      export AKASH_KEY_NAME=relay-key
+#      export AKASH_KEYRING_BACKEND=os
+#      export AKASH_NET=https://raw.githubusercontent.com/akash-network/net/master/mainnet
+#      export AKASH_NODE=$(curl -s "$AKASH_NET/rpc-nodes.txt" | head -1)
+#      export AKASH_CHAIN_ID=$(curl -s "$AKASH_NET/chain-id.txt")
+#
+# 3. Fund the escrow wallet:
+#    Buy ≥5 AKT on Osmosis DEX (https://app.osmosis.zone) or Kraken/Binance.
+#    Send to your akash1... address. Minimum 5 AKT to open a deployment.
+#
+# 4. Create the deployment and wait for bids:
+#      akash tx deployment create akash/deploy.yaml --from relay-key --gas auto --gas-adjustment 1.3
+#      export DSEQ=$(akash query deployment list --owner $(akash keys show relay-key -a) -o json | jq -r '.deployments[-1].deployment.deployment_id.dseq')
+#      akash query market bid list --owner $(akash keys show relay-key -a) --dseq $DSEQ
+#
+# 5. Accept the cheapest bid (replace PROVIDER with the bid's provider address):
+#      export PROVIDER=<provider-address-from-bid-list>
+#      akash tx market lease create --dseq $DSEQ --provider $PROVIDER --from relay-key --gas auto --gas-adjustment 1.3
+#
+# 6. Send the manifest to start the container:
+#      akash provider send-manifest akash/deploy.yaml --dseq $DSEQ --provider $PROVIDER --from relay-key
+#
+# 7. Check that it's running and get the public URL:
+#      akash provider lease-status --dseq $DSEQ --provider $PROVIDER --from relay-key
+#
+# ── How escrow works ─────────────────────────────────────────────────────────
+# AKT is deposited into an on-chain escrow account at deployment time.
+# The escrow drains at the rate set by the winning bid (uakt/block).
+# Block time ≈ 6.098 seconds → ~430,834 blocks/month.
+# (Source: Akash Console, priceUtils.ts: 30.437 days × 86400 / 6.098)
+#
+# How much to deposit?
+#   monthly_burn = bid_rate_uakt × 430,834 / 1,000,000   (in AKT)
+#
+# At the SDL's max bid ceiling of 10,000 uakt/block:
+#   10,000 × 430,834 / 1,000,000 = 4,308 AKT/month  ← ceiling (no provider
+#   actually bids this high — your SDL is setting the maximum you'll accept)
+#
+# Typical winning bids for 0.5 vCPU / 512Mi RAM: 50–200 uakt/block
+#   100 × 430,834 / 1,000,000 = 43.1 AKT/month  ← realistic estimate
+#    50 × 430,834 / 1,000,000 = 21.5 AKT/month  ← cheap provider
+#
+# Rule: Keep ≥ 2× monthly burn in escrow at all times.
+# - At 100 uakt/block bid: top up when escrow < 86 AKT
+# - Recommended starting escrow: ~150 AKT (≈ 3 months at 100 uakt/block)
+#
+# The agent monitors escrow automatically:
+#   anomaly: akash_escrow_low fires when < 1.5 months runway remain
+#   tool: topup_akash_escrow deposits more AKT from the agent's Akash wallet
+#
+# ── Cost vs revenue check ────────────────────────────────────────────────────
+# Hosting: 3.7–18.5 AKT/month ≈ $3–$18/month (depending on AKT price and bid)
+# Revenue at 0.3% fee on $100 avg tx:  70–220 tx/month covers all costs
+# Break-even: ~2–7 transactions per day — a very low bar.
+
+---
+
+version: "2.0"
+
+services:
+  relay:
+    image: YOUR_DOCKERHUB_USERNAME/charon:latest
+    # ── Environment ──────────────────────────────────────────────────────────
+    # IMPORTANT: WDK_SEED_PHRASE controls all wallets (Tron, EVM, Akash).
+    # This env block is encrypted in the signed manifest sent to the provider.
+    # It is NOT visible on-chain — only the hashed SDL is public.
+    # Still: rotate the seed phrase if the deployment is ever compromised.
+    env:
+      - WDK_SEED_PHRASE=                    # REQUIRED: BIP-39 mnemonic
+      - RELAY_FEE_PERCENT=0.3               # relay fee charged to developers
+      - AAVE_MIN_FLOAT_DAYS=2               # days of float to keep liquid
+      - AAVE_POOL_ADDRESS=0x794a61358D6845594F94dc1DB02A252b5b4814aD  # Arbitrum Aave v3
+      - CLAW_ROUTER_URL=https://api.clawrouter.ai/v1
+      - CLAW_ROUTER_MODEL=claude
+      - CLAW_ROUTER_MODEL_BOARD=opus
+      - MAX_PAYMENT_PER_CALL_USDC=0.50
+      - AKASH_DEPLOYMENT_DSEQ=             # fill in after first deployment (for escrow monitoring)
+      - PORT=3000
+    expose:
+      - port: 3000
+        as: 80
+        to:
+          - global: true
+
+profiles:
+  compute:
+    relay:
+      resources:
+        # 0.5 vCPU covers both Node.js relay and Python OpenClaw bridge at idle.
+        # Under load (board meetings + anomaly checks) peak usage is ~0.3 vCPU.
+        cpu:
+          units: 0.5
+        # 512 Mi is enough for a normal run. Bump to 1 Gi if you see OOM.
+        memory:
+          size: 512Mi
+        storage:
+          # SQLite database + agent logs + node_modules.
+          # 10 Gi is generous — actual usage is ~500 MB.
+          size: 10Gi
+  placement:
+    anyworld:
+      # No geographic constraint — broadest provider pool = lowest price.
+      # If you want EU/US data residency, add:
+      #   attributes:
+      #     region: us-east    (or eu-west)
+      pricing:
+        relay:
+          denom: uakt
+          # This is your MAXIMUM bid per block — you only pay what providers
+          # actually bid, which is usually well below this ceiling.
+          # Typical winning bids for 0.5 vCPU / 512Mi: 50–200 uakt/block.
+          #
+          # Setting too low (e.g. 100) means no providers bother bidding.
+          # Setting 10,000 is the common SDL default — it's a ceiling, not a price.
+          #
+          # At 10,000 uakt ceiling → worst case 4,308 AKT/month (no provider bids this)
+          # At 100 uakt actual bid → 43.1 AKT/month (~$43–86 at $1–2/AKT)
+          # At  50 uakt actual bid → 21.5 AKT/month (~$22–43)
+          amount: 10000
+
+deployment:
+  relay:
+    anyworld:
+      profile: relay
+      count: 1
