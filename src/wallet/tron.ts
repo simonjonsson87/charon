@@ -214,33 +214,6 @@ export async function getBalance(address: string): Promise<string> {
   }
 }
 
-/**
- * getBalanceLegacy — TronGrid REST fallback (unreliable for unactivated addresses).
- * Kept for reference; not used in the monitor hot path.
- */
-async function getBalanceLegacy(address: string): Promise<string> {
-  if (!tronWeb) throw new Error('[wallet/tron] Wallet not initialised.');
-
-  try {
-    const headers: Record<string, string> = {};
-    if (apiKey) headers['TRON-PRO-API-KEY'] = apiKey;
-
-    const res = await axios.get(
-      `${tronGridUrl}/v1/accounts/${address}`,
-      { headers, timeout: 5000 },
-    );
-
-    const trc20Balances: Record<string, string>[] = res.data?.data?.[0]?.trc20 ?? [];
-    const usdtEntry = trc20Balances.find((b) => b[USDT_CONTRACT] !== undefined);
-    const rawBalance = usdtEntry ? parseInt(usdtEntry[USDT_CONTRACT]!, 10) : 0;
-
-    return (rawBalance / 1_000_000).toFixed(6);
-  } catch (err) {
-    console.error(`[wallet/tron] getBalance(${address}) failed:`, err);
-    return '0.000000';
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Event watching
 // ---------------------------------------------------------------------------
