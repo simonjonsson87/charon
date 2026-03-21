@@ -71,23 +71,51 @@ version: "2.0"
 
 services:
   relay:
-    image: YOUR_DOCKERHUB_USERNAME/charon:latest
+    image: ghcr.io/simonjonsson87/charon:latest
     # ── Environment ──────────────────────────────────────────────────────────
     # IMPORTANT: WDK_SEED_PHRASE controls all wallets (Tron, EVM, Akash).
     # This env block is encrypted in the signed manifest sent to the provider.
     # It is NOT visible on-chain — only the hashed SDL is public.
     # Still: rotate the seed phrase if the deployment is ever compromised.
     env:
-      - WDK_SEED_PHRASE=                    # REQUIRED: BIP-39 mnemonic
-      - RELAY_FEE_PERCENT=0.3               # relay fee charged to developers
-      - AAVE_MIN_FLOAT_DAYS=2               # days of float to keep liquid
-      - AAVE_POOL_ADDRESS=0x794a61358D6845594F94dc1DB02A252b5b4814aD  # Arbitrum Aave v3
+      - WDK_SEED_PHRASE=gift all illegal barely high match harvest old burden wasp spoil warm
+      - TRON_RPC_URL=https://api.shasta.trongrid.io
+      - TRON_USDT_CONTRACT=TG3XXyExBkPp9nzdajDZsozEu4BkaSJozs
+      - TRON_API_KEY=bb2ed6e9-7f34-45be-9313-3d9f4e0f8b2c
+      - TRON_SUNSWAP_ROUTER=TKzxdSv2FZKQrEqkKVgp5DcwEXBEKMg2Ax
+      - TRON_WTRX_CONTRACT=TNUC9Qb1rRpS5CbWLmNMxXBjyFoydXjWFR
+      - BASE_RPC_URL=https://mainnet.base.org
+      - USDC_BASE_ADDRESS=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+      - ARBITRUM_RPC_URL=https://arb1.arbitrum.io/rpc
+      - USDT_ARBITRUM_ADDRESS=0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9
+      - UNISWAP_SWAP_ROUTER=0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45
+      - WETH9_ARBITRUM_ADDRESS=0x82aF49447D8a07e3bd95BD0d56f35241523fBab1
+      - AAVE_POOL_ADDRESS=0x794a61358D6845594F94dc1DB02A252b5b4814aD
+      - AAVE_ASSET_ADDRESS=0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9
+      - AKASH_REST_ENDPOINT=https://api.akashnet.net
+      - AKASH_RPC_ENDPOINT=https://rpc.akashnet.net:443
+      - AKASH_GRPC_ENDPOINT=akash.lavenderfive.com:443
+      - AKASH_ADDRESS=akash1d6q2s2ugejczfdp2gn738mtavf77w0ngt9lcw4
+      - AKASH_PUB_KEY=A0vDjeiwCJdqDY23sDQPDceHQkw7rniUtIUJGaTatXuq
+      - AKASH_DEPLOYMENT_DSEQ=26007705
+      - CDP_API_KEY_NAME=604867de-bb5e-4b01-8aa4-ac9578505d72
+      - CDP_API_KEY_PRIVATE_KEY=wmUf4p9RrbUgjzbsJY3PkCyAvpZFDHMZXQAm65OTgDIeKWmimIYv0OLT1H/8TT6YPMbmTb3+CYvwanZuF1Qq8g==
       - CLAW_ROUTER_URL=https://api.clawrouter.ai/v1
       - CLAW_ROUTER_MODEL=claude
-      - CLAW_ROUTER_MODEL_BOARD=opus
+      - CLAW_ROUTER_MODEL_OPUS=opus
       - MAX_PAYMENT_PER_CALL_USDC=0.50
-      - AKASH_DEPLOYMENT_DSEQ=             # fill in after first deployment (for escrow monitoring)
+      - ADMIN_API_KEY=5d9086ce4acaecd4a4a4f285040c895fea319157c9c7a008eb2289b0d7612118
+      - OPENCLAW_AGENT_PATH=./agent
+      - SQLITE_PATH=./data/agent.db
       - PORT=3000
+      - LOG_LEVEL=info
+      - MIN_PAYMENT_USDT=1.00
+      - RELAY_FEE_PERCENT=0.3
+      - AAVE_MIN_FLOAT_DAYS=2
+      - BOARD_MEETING_CRON=0 0 * * *
+      - TRON_POLL_INTERVAL_MS=3000
+      - WEBHOOK_RETRY_COUNT=5
+      - WEBHOOK_RETRY_INTERVAL_MS=10000
     expose:
       - port: 3000
         as: 80
@@ -108,7 +136,7 @@ profiles:
         storage:
           # SQLite database + agent logs + node_modules.
           # 10 Gi is generous — actual usage is ~500 MB.
-          size: 10Gi
+          size: 5Gi
   placement:
     anyworld:
       # No geographic constraint — broadest provider pool = lowest price.

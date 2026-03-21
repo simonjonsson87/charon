@@ -22,20 +22,23 @@
  *   - Runway calculation (days of operating costs covered by current balance)
  *   - All pending experiments
  *   - Current energy market data
- *   - Current network timing signal
- *   - A fresh snapshot of competitor pricing (fetched here, not from cache)
+ *   - Current energy market data (includes live TRX price and gas costs)
+ *   - Live EVM gas prices (Arbitrum + Base) and ETH/USD price for cost estimates
+ *   - Akash escrow drain rate converted to daily USD cost for runway
  */
 
 import { runAgentSession } from './client';
 import { getRollingMetrics } from '../monitoring/metrics';
 import { getBalance, getTronWalletAddress } from '../wallet/tron';
-import { getUsdcBalance, getUsdtBalance, getEthBalance } from '../wallet/evm';
+import { getUsdcBalance, getUsdtBalance, getEthBalance, getGasPriceGwei } from '../wallet/evm';
 import { getDepositedBalance, getCurrentApy } from '../wallet/aave';
 import { getAgentTrxBalance } from '../wallet/tronGasfree';
 import { getAktBalance, getEscrowBalance, type EscrowStatus } from '../wallet/akash';
-import { getLatestEnergyData } from '../intelligence/energy';
+import { getBridgeFees, type BridgeQuote } from '../wallet/bridge';
+import { getLatestEnergyData, type EnergyData } from '../intelligence/energy';
 import { getAllExperiments } from '../db/queries/experiments';
 import { getLogs } from '../db/logger';
+import { getSettingAsFloat, SETTING_KEYS } from '../db/queries/settings';
 import { db } from '../db/index';
 
 // ---------------------------------------------------------------------------
@@ -78,9 +81,13 @@ interface RunwayData {
  * This function is intentionally "thin" — it just collects data and passes it
  * to the agent. All decisions are made by the agent inside OpenClaw.
  */
-export async function runBoardMeeting(): Promise<void> {
-  console.log('[board-meeting] Assembling context...');
-
+/**
+ * assembleBoardMeetingContext — Collect all data the agent needs for a board meeting.
+ *
+ * Exported so that /admin/status can return the same parcel without triggering
+ * a full agent session.
+ */
+export async function assembleBoardMeetingContext(): Promise<Record<string, unknown>> {
   const [
     metrics24h,
     metrics7d,
@@ -90,7 +97,11 @@ export async function runBoardMeeting(): Promise<void> {
     allExperiments,
     energyData,
     operationalStats,
-    competitorPricing,
+    bridgeFeeQuotes,
+    ethPriceUsd,
+    aktPriceUsd,
+    arbGasPriceGwei,
+    baseGasPriceGwei,
   ] = await Promise.all([
     Promise.resolve(getRollingMetrics(1)),
     Promise.resolve(getRollingMetrics(7)),
@@ -100,23 +111,37 @@ export async function runBoardMeeting(): Promise<void> {
     Promise.resolve(getAllExperiments()),
     Promise.resolve(getLatestEnergyData()),
     assembleOperationalStats(),
-    fetchCompetitorPricing(),
+    getBridgeFees('10').catch((): BridgeQuote[] => []),
+    fetchTokenPriceUsd('ethereum').catch(() => 0),
+    fetchTokenPriceUsd('akash-network').catch(() => 0),
+    getGasPriceGwei('arbitrum').catch(() => 0),
+    getGasPriceGwei('base').catch(() => 0),
   ]);
 
-  const runway = calculateRunway(balances, metrics7d.totalLlmCostUsd / 7);
-
-  // Akash escrow status (optional — only if deployment is configured).
   let akashStatus: EscrowStatus | null = null;
   const dseq = process.env.AKASH_DEPLOYMENT_DSEQ;
   if (dseq) {
     akashStatus = await getEscrowBalance(dseq).catch(() => null);
   }
 
-  // Recent anomaly log entries (last 24 hours) for the agent's awareness.
+  // Daily Akash hosting cost: drain rate → AKT/month → AKT/day → USD/day.
+  const dailyAkashCostUsd = (akashStatus?.monthlyBurnAkt != null && aktPriceUsd > 0)
+    ? (akashStatus.monthlyBurnAkt / 30) * aktPriceUsd
+    : 0;
+
+  const runway = calculateRunway(balances, metrics7d.totalLlmCostUsd / 7, dailyAkashCostUsd);
+
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const recentAnomalies = getLogs({ category: 'ANOMALY', since: since24h, limit: 20 });
 
-  const context = {
+  const toolCosts = {
+    note: 'Bridge fees include protocol fee + destination gas. Gas costs are live (current gas price × estimated gas units × ETH price). All amounts in USD.',
+    referenceAmountUsd: '10',
+    bridgeFeeQuotes,
+    gasEstimatesUsd: computeGasEstimates(arbGasPriceGwei, baseGasPriceGwei, ethPriceUsd, energyData),
+  };
+
+  return {
     timestamp: new Date().toISOString(),
     metrics: {
       last24h: metrics24h,
@@ -125,9 +150,13 @@ export async function runBoardMeeting(): Promise<void> {
     },
     balances,
     runway,
-    currentRelayFeePercent: parseFloat(process.env.RELAY_FEE_PERCENT ?? '0.3'),
-    competitorPricing,
+    // DB value takes priority over env var — the agent updates the DB via update_fee().
+    currentRelayFeePercent: getSettingAsFloat(
+      SETTING_KEYS.RELAY_FEE_PERCENT,
+      parseFloat(process.env.RELAY_FEE_PERCENT ?? '0.3'),
+    ),
     akashHosting: akashStatus,
+    toolCosts,
     operationalStats,
     recentAnomalies: recentAnomalies.map((l) => ({
       level: l.level,
@@ -151,6 +180,12 @@ export async function runBoardMeeting(): Promise<void> {
         }
       : null,
   };
+}
+
+export async function runBoardMeeting(): Promise<void> {
+  console.log('[board-meeting] Assembling context...');
+
+  const context = await assembleBoardMeetingContext();
 
   console.log('[board-meeting] Context assembled. Starting agent session...');
   console.log('[board-meeting] Context parcel:\n' + JSON.stringify(context, null, 2));
@@ -270,11 +305,13 @@ function assembleOperationalStats(): OperationalStats {
 function calculateRunway(
   balances: BalanceSnapshot,
   dailyLlmCostUsd: number,
+  dailyAkashCostUsd: number,
 ): RunwayData {
-  // Gas cost estimate: ~2 TRX energy sponsorships/day × $0.003 each + RPC call overhead.
+  // Tron energy sponsorship overhead: ~$0.05/day at low volume.
+  // EVM gas for rebalancing ops: ~$0.05/day.
   // Refined by the agent over time through experiment outcomes in MEMORY.md.
   const dailyGasCostUsd = 0.10;
-  const dailyOperatingCostUsd = dailyLlmCostUsd + dailyGasCostUsd;
+  const dailyOperatingCostUsd = dailyLlmCostUsd + dailyAkashCostUsd + dailyGasCostUsd;
   const liquidUsd = parseFloat(balances.totalUsdtEquivalent);
   const runwayDays = dailyOperatingCostUsd > 0 ? liquidUsd / dailyOperatingCostUsd : Infinity;
 
@@ -285,48 +322,75 @@ function calculateRunway(
   };
 }
 
+// TODO(competitor-pricing): Add live competitor pricing data to the board meeting context.
+// Competitors: NOWPayments (0.5%), Plisio (0.5%), CoinPayments (0.5%),
+// CryptoProcessing (0.8%), TripleA (1.0%).
+// None currently expose a reliable public API for TRC-20 USDT rates.
+// Options: scrape their pricing pages, use a third-party aggregator, or maintain
+// a manually-updated static list checked into AGENTS.md.
+
 /**
- * fetchCompetitorPricing — Return known competitor USDT relay / payment processor fees.
+ * fetchTokenPriceUsd — Fetch a token's current USD price from CoinGecko.
  *
- * Rates are manually verified and updated here. TRON USDT relay is a niche market;
- * there is no public API that aggregates these rates, so we maintain them as a
- * known-good baseline and update when competitors change their published pricing.
- *
- * Sources (last verified 2026-03-14):
- *   NOWPayments   https://nowpayments.io/payment-tools/crypto-payment-gateway — 0.5%
- *   Plisio        https://plisio.net/pricing — 0.5%
- *   CoinPayments  https://www.coinpayments.net/help-fees — 0.5%
- *   CryptoProcessing https://cryptoprocessing.com/fees — 0.8%
- *   TripleA       https://triple-a.io/pricing — 1.0%
- *
- * Additionally attempts to fetch the NOWPayments live rate from their public
- * pricing page as a real-time sanity check. Falls back to the static list on error.
+ * @param coinId  CoinGecko coin ID (e.g. 'ethereum', 'akash-network')
  */
-async function fetchCompetitorPricing(): Promise<
-  { name: string; feePercent: number; source: string }[]
-> {
-  const staticRates = [
-    { name: 'NOWPayments',       feePercent: 0.5,  source: 'nowpayments.io' },
-    { name: 'Plisio',            feePercent: 0.5,  source: 'plisio.net' },
-    { name: 'CoinPayments',      feePercent: 0.5,  source: 'coinpayments.net' },
-    { name: 'CryptoProcessing',  feePercent: 0.8,  source: 'cryptoprocessing.com' },
-    { name: 'TripleA',           feePercent: 1.0,  source: 'triple-a.io' },
-  ];
+async function fetchTokenPriceUsd(coinId: string): Promise<number> {
+  const axios = (await import('axios')).default;
+  const res = await axios.get('https://api.coingecko.com/api/v3/simple/price', {
+    params: { ids: coinId, vs_currencies: 'usd' },
+    timeout: 5_000,
+  });
+  return res.data?.[coinId]?.usd ?? 0;
+}
 
-  // Attempt live rate for NOWPayments (they publish fees via their API).
-  // This is best-effort — we don't block the board meeting if it fails.
-  try {
-    const axios = (await import('axios')).default;
-    const res = await axios.get('https://nowpayments.io/api/v1/fees', { timeout: 4000 });
-    const tronUsdtFee: number | undefined = res.data?.USDTTRC20?.fee_percent;
-    if (typeof tronUsdtFee === 'number') {
-      staticRates[0] = { ...staticRates[0], feePercent: tronUsdtFee };
-    }
-  } catch {
-    // Live fetch failed — static value is used as-is.
-  }
+/**
+ * computeGasEstimates — Calculate live gas cost estimates per tool.
+ *
+ * Uses current on-chain gas prices (fetched from each chain's provider) and
+ * the current ETH/USD price to give the agent accurate cost figures.
+ *
+ * Gas unit estimates per operation type (approximate):
+ *   Uniswap v3 swap on Arbitrum (wrap + approve + exactInputSingle): ~330k gas
+ *   Uniswap v3 swap on Base (approve/wrap + exactInputSingle):        ~280k gas
+ *   Aave v3 supply (approve + supply):                                ~250k gas
+ *   Aave v3 withdraw:                                                 ~200k gas
+ *
+ * Tron costs use the energy module's burn cost (in TRX) × TRX/USD.
+ * A SunSwap v2 swap uses ~2.5× more energy than a plain USDT transfer.
+ */
+function computeGasEstimates(
+  arbGasPriceGwei: number,
+  baseGasPriceGwei: number,
+  ethPriceUsd: number,
+  energyData: EnergyData | null,
+): Record<string, unknown> {
+  const evmUsd = (gasPriceGwei: number, gasUnits: number): string => {
+    if (!ethPriceUsd || !gasPriceGwei) return 'unknown';
+    return `$${(gasPriceGwei * 1e-9 * gasUnits * ethPriceUsd).toFixed(4)}`;
+  };
 
-  return staticRates;
+  const tronSwapUsd = energyData
+    ? `$${(energyData.burnCostTrx * 2.5 * energyData.trxPriceUsd).toFixed(4)}`
+    : 'unknown';
+
+  return {
+    source: 'live (on-chain gas price × estimated gas units × CoinGecko price)',
+    ethPriceUsd,
+    arbGasPriceGwei,
+    baseGasPriceGwei,
+    trxPriceUsd:             energyData?.trxPriceUsd ?? null,
+    swap_tron_usdt_for_trx:  tronSwapUsd,
+    swap_tron_trx_for_usdt:  tronSwapUsd,
+    swap_usdt_to_eth_arb:    evmUsd(arbGasPriceGwei, 330_000),
+    swap_eth_to_usdt_arb:    evmUsd(arbGasPriceGwei, 330_000),
+    swap_usdc_to_eth_base:   evmUsd(baseGasPriceGwei, 280_000),
+    swap_eth_to_usdc_base:   evmUsd(baseGasPriceGwei, 280_000),
+    deposit_to_aave:         evmUsd(arbGasPriceGwei, 250_000),
+    withdraw_from_aave:      evmUsd(arbGasPriceGwei, 200_000),
+    deposit_usdc_to_aave:    evmUsd(baseGasPriceGwei, 250_000),
+    withdraw_usdc_from_aave: evmUsd(baseGasPriceGwei, 200_000),
+    topup_akash_escrow:      '<$0.01',
+  };
 }
 
 /**
@@ -350,16 +414,17 @@ All data you need is pre-loaded in the context object below this message.
 | context.metrics.last24h / last7d / last30d | get_metrics |
 | context.balances (all wallets: Tron USDT, Base USDC, Arb USDT+ETH, Aave, TRX, AKT) | get_capital_summary, get_eth_balance_arb, get_akt_balance |
 | context.runway | get_runway |
-| context.akashHosting (escrow balance + runway, or null) | get_akash_escrow_status |
+| context.akashHosting (escrow balance + runway, null if AKASH_DEPLOYMENT_DSEQ unset) | get_akash_escrow_status |
+| context.toolCosts.bridgeFeeQuotes (live quotes for all bridge routes at $10 ref) | get_bridge_fees |
+| context.toolCosts.gasEstimatesUsd (live gas cost per tool: chain gas price × units × ETH/USD) | — |
 | context.pendingExperiments + context.experimentHistory | get_experiments |
-| context.currentRelayFeePercent | — |
-| context.competitorPricing | — |
+| context.currentRelayFeePercent (from DB — reflects any agent update_fee calls) | — |
 | context.operationalStats (developer count, pool size, success rate) | — |
 | context.recentAnomalies | — |
 
 ## Tools to call only for ACTIONS
 
-- **Decisions**: update_fee, deposit_to_aave, withdraw_from_aave, swap_tron_usdt_for_trx, swap_usdt_to_eth_arb, bridge_tron_to_arbitrum, topup_akash_escrow
+- **Decisions**: update_fee, deposit_to_aave, withdraw_from_aave, swap_tron_usdt_for_trx, swap_usdt_to_eth_arb, bridge_tron_to_arbitrum, bridge_arbitrum_to_tron, bridge_tron_to_base, bridge_base_to_arbitrum, bridge_arbitrum_usdc_to_base, bridge_arbitrum_eth_to_base, bridge_base_usdc_to_akt, topup_akash_escrow
 - **Recording**: save_experiment (before any significant action), evaluate_experiment (for overdue experiments)
 - **Memory**: update_memory (once, at the end, with a 2–3 paragraph summary)
 
@@ -368,7 +433,7 @@ All data you need is pre-loaded in the context object below this message.
 1. **Financial review** — use context.metrics to assess 24h and 7d performance.
 2. **Experiment evaluation** — check context.pendingExperiments for any past their checkDate. Call evaluate_experiment for those.
 3. **Capital allocation** — use context.balances + context.runway. Act if TRX reserve is low, Aave needs rebalancing, or Akash escrow (context.akashHosting) is below 1.5 months.
-4. **Pricing** — compare context.currentRelayFeePercent to context.competitorPricing. If adjusting: save_experiment first, then update_fee.
+4. **Pricing** — review context.currentRelayFeePercent relative to revenue trend. If adjusting: save_experiment first, then update_fee.
 5. **Summary** — call update_memory once with a concise 2–3 paragraph board meeting summary.
 `.trim();
 }

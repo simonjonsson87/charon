@@ -34,8 +34,9 @@ let tronWeb: typeof TronWeb | null = null;
 let tronGridUrl = 'https://api.trongrid.io';
 let apiKey: string | undefined;
 
-// The agent's primary TRX address (HD index 0) — used as the energy payer.
+// The agent's primary TRX address and private key (HD index 0) — used as the energy payer.
 let agentTronAddress: string | null = null;
+let agentPrivateKey: string | null = null;
 
 // ---------------------------------------------------------------------------
 // Initialisation
@@ -61,9 +62,10 @@ export async function initTronGasfreeWallet(): Promise<void> {
 
   tronWeb = new TronWeb({ fullHost: tronGridUrl, headers });
 
-  // Derive the agent's primary address (index 0)
+  // Derive the agent's primary address and key (index 0)
   const account = TronWeb.fromMnemonic(seed, `m/44'/195'/0'/0/0`);
   agentTronAddress = account.address as string;
+  agentPrivateKey = (account.privateKey as string).replace(/^0x/, '');
 
   console.log('[wallet/tronGasfree] Gasless wallet initialised. Agent address:', agentTronAddress);
 }
@@ -143,6 +145,79 @@ export async function checkNeedsSponsorship(address: string): Promise<boolean> {
 }
 
 /**
+ * activateIfNeeded — Send a small TRX amount to activate an unactivated TRON address.
+ *
+ * An unactivated address (one that has never received TRX or been explicitly
+ * created on-chain) cannot broadcast transactions — including the USDT transfer
+ * needed to forward the payment. This function checks whether the address exists
+ * on-chain and, if not, sends 1 TRX from the agent hot wallet to activate it.
+ *
+ * The 1 TRX stays at the address. For pool addresses that get reused, the
+ * activation cost is paid only once.
+ *
+ * Returns true if the address was activated (or was already active), false on error.
+ */
+export async function activateIfNeeded(address: string): Promise<boolean> {
+  if (!tronWeb || !agentTronAddress || !agentPrivateKey) {
+    console.warn('[wallet/tronGasfree] activateIfNeeded: not initialised.');
+    return false;
+  }
+
+  try {
+    // getAccount returns an empty object for unactivated addresses.
+    const accountInfo = await tronWeb.trx.getAccount(address);
+    const isActivated = accountInfo && Object.keys(accountInfo).length > 0;
+
+    if (isActivated) {
+      return true;
+    }
+
+    console.log(`[wallet/tronGasfree] Address ${address} is unactivated — sending 1 TRX to activate.`);
+
+    const signerWeb = new TronWeb({
+      fullHost: tronGridUrl,
+      headers: apiKey ? { 'TRON-PRO-API-KEY': apiKey } : {},
+      privateKey: agentPrivateKey,
+    });
+
+    // Check agent TRX balance before attempting — a zero balance is the most
+    // common reason for a silent rejection and needs an actionable error.
+    const agentBalanceSun: number = await signerWeb.trx.getBalance(agentTronAddress);
+    if (agentBalanceSun < 2_000_000) {
+      console.error(
+        `[wallet/tronGasfree] Cannot activate ${address}: agent wallet has only` +
+        ` ${(agentBalanceSun / 1e6).toFixed(3)} TRX (need ≥2 TRX).` +
+        ` Fund ${agentTronAddress} with Shasta TRX: https://shasta.tronex.io/`,
+      );
+      return false;
+    }
+
+    // Send 1 TRX (1_000_000 SUN) — the minimum to create the account on-chain.
+    const tx = await signerWeb.trx.sendTransaction(address, 1_000_000);
+    if (tx.result) {
+      console.log(`[wallet/tronGasfree] Activation TX sent for ${address}: ${tx.txid}`);
+      // Wait one block (~3s) for activation to land before energy delegation.
+      await new Promise((r) => setTimeout(r, 3500));
+      return true;
+    }
+
+    // tx.result === false — log everything useful from the response.
+    const reason = (tx as { message?: string })?.message ?? JSON.stringify(tx);
+    console.error(
+      `[wallet/tronGasfree] Activation TX rejected for ${address}. Reason: ${reason}`,
+    );
+    return false;
+  } catch (err: unknown) {
+    // TronWeb errors are often plain strings or objects — extract the message.
+    const msg = typeof err === 'string' ? err
+      : (err as { message?: string })?.message
+      ?? JSON.stringify(err);
+    console.error(`[wallet/tronGasfree] activateIfNeeded(${address}) threw: ${msg}`);
+    return false;
+  }
+}
+
+/**
  * sponsorEnergy — Rent energy to a user address for one USDT transfer.
  *
  * Uses the provider recommended by the energy intelligence service.
@@ -217,48 +292,65 @@ async function sponsorViaTrEnergy(
 }
 
 /**
- * sponsorViaBurn — Activate energy by freezing TRX from the agent's reserve.
+ * sponsorViaBurn — Fund the payment address with enough TRX to cover energy costs.
  *
- * Last resort: used when rental APIs are unavailable. Freezes TRX from the
- * agent's primary address to generate energy for the target address.
- * The TRX is frozen for 3 days minimum (TRON protocol requirement).
+ * Last resort used when rental APIs (TronSave / TR.ENERGY) are unavailable
+ * (e.g. testnet, API downtime). Sends TRX directly to the payment address;
+ * when forwardPayment() executes the USDT transfer, TRON burns that TRX for
+ * energy at the current network rate.
+ *
+ * This is more expensive per-payment than energy rental (~27 TRX vs ~0.05 TRX
+ * on mainnet) but guarantees the transfer goes through without external APIs.
+ * On mainnet the rental providers should be preferred; this is only the fallback.
  */
 async function sponsorViaBurn(
   address: string,
   energy: number,
 ): Promise<{ success: boolean; trxCost: string }> {
-  if (!agentTronAddress) {
+  if (!agentTronAddress || !agentPrivateKey) {
+    console.error('[wallet/tronGasfree] sponsorViaBurn: not initialised.');
     return { success: false, trxCost: '0' };
   }
 
   try {
-    // Estimate TRX needed for the required energy at current market rate.
     const { getLatestEnergyData } = await import('../intelligence/energy');
     const energyData = getLatestEnergyData();
+    // Burn rate: sun per energy unit. Default 420 sun (≈ mainnet typical).
     const priceSun = energyData?.energyPriceSun ?? 420;
-    const costTrx = (energy * priceSun) / 1_000_000;
+    // Add 20% buffer so the transfer doesn't fail due to price fluctuation.
+    const sunNeeded = Math.ceil(energy * priceSun * 1.2);
+    const trxNeeded = sunNeeded / 1_000_000;
 
-    // TronWeb: delegate energy (freeze TRX for the target address).
-    // This uses the v2 mechanism (STAKE_ENERGY resource type).
-    const res = await tronWeb.trx.freezeBalanceV2(
-      Math.round(costTrx * 1_000_000), // TRX amount in SUN
-      'ENERGY',
-    );
-
-    if (res.result) {
-      // After freezing, delegate the energy to the target address.
-      await tronWeb.trx.delegateResource(
-        Math.round(costTrx * 1_000_000),
-        address,
-        'ENERGY',
-        agentTronAddress,
+    const agentBalanceSun: number = await tronWeb.trx.getBalance(agentTronAddress);
+    if (agentBalanceSun < sunNeeded + 2_000_000) {
+      console.error(
+        `[wallet/tronGasfree] sponsorViaBurn: agent has ${(agentBalanceSun / 1e6).toFixed(3)} TRX,` +
+        ` need ${(trxNeeded + 2).toFixed(3)} TRX. Fund ${agentTronAddress}.`,
       );
+      return { success: false, trxCost: '0' };
     }
 
-    console.log(`[wallet/tronGasfree] Burn sponsor: ${costTrx.toFixed(6)} TRX → ${energy} energy for ${address}.`);
-    return { success: true, trxCost: costTrx.toFixed(6) };
-  } catch (err) {
-    console.error('[wallet/tronGasfree] Burn sponsor failed:', err);
+    const signerWeb = new TronWeb({
+      fullHost: tronGridUrl,
+      headers: apiKey ? { 'TRON-PRO-API-KEY': apiKey } : {},
+      privateKey: agentPrivateKey,
+    });
+
+    const tx = await signerWeb.trx.sendTransaction(address, sunNeeded);
+    if (!tx.result) {
+      const reason = (tx as { message?: string })?.message ?? JSON.stringify(tx);
+      console.error(`[wallet/tronGasfree] sponsorViaBurn TX rejected: ${reason}`);
+      return { success: false, trxCost: '0' };
+    }
+
+    console.log(
+      `[wallet/tronGasfree] Burn sponsor: sent ${trxNeeded.toFixed(6)} TRX to ${address}` +
+      ` to cover ${energy} energy. TX: ${tx.txid}`,
+    );
+    return { success: true, trxCost: trxNeeded.toFixed(6) };
+  } catch (err: unknown) {
+    const msg = typeof err === 'string' ? err : (err as { message?: string })?.message ?? JSON.stringify(err);
+    console.error(`[wallet/tronGasfree] sponsorViaBurn failed: ${msg}`);
     return { success: false, trxCost: '0' };
   }
 }

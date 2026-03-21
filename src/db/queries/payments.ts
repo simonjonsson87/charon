@@ -123,7 +123,7 @@ export function updatePaymentStatus(
 export function getActivePayments(): Payment[] {
   return db.prepare(`
     SELECT * FROM payments
-    WHERE status IN ('pending', 'detected')
+    WHERE status IN ('pending', 'detected', 'bridging')
     ORDER BY created_at ASC
   `).all() as Payment[];
 }
@@ -223,24 +223,38 @@ export function releaseAddress(index: number): void {
 export async function ensurePoolSize(
   targetSize: number,
   deriveAddress: (index: number) => Promise<string>,
+  startIndex = 3,
 ): Promise<void> {
-  const current = db.prepare('SELECT COUNT(*) as count FROM address_pool').get() as {
-    count: number;
-  };
+  // Remove any available pool entries below startIndex — those indices are
+  // reserved for the agent's own operational wallets (hot wallet, gas wallet, etc.)
+  // and must never be handed out as payment deposit addresses.
+  db.prepare(`DELETE FROM address_pool WHERE idx < ? AND status = 'available'`).run(startIndex);
 
-  const existing = current.count;
+  // Count how many usable pool entries (idx >= startIndex) already exist.
+  const existing = (db.prepare(
+    'SELECT COUNT(*) as count FROM address_pool WHERE idx >= ?'
+  ).get(startIndex) as { count: number }).count;
+
   if (existing >= targetSize) return;
 
-  console.log(`[address-pool] Growing pool from ${existing} to ${targetSize} addresses...`);
+  // Derive indices from startIndex upward, skipping ones already in the pool.
+  const inPool = new Set<number>(
+    (db.prepare('SELECT idx FROM address_pool WHERE idx >= ?').all(startIndex) as { idx: number }[])
+      .map(r => r.idx)
+  );
 
-  for (let i = existing; i < targetSize; i++) {
+  console.log(`[address-pool] Growing pool from ${existing} to ${targetSize} addresses (start index ${startIndex})...`);
+
+  let added = existing;
+  for (let i = startIndex; added < targetSize; i++) {
+    if (inPool.has(i)) continue;
     const address = await deriveAddress(i);
-    // INSERT OR IGNORE so re-running on startup doesn't error.
     db.prepare(`
       INSERT OR IGNORE INTO address_pool (idx, address, status, payment_id, last_used_at)
       VALUES (?, ?, 'available', NULL, NULL)
     `).run(i, address);
+    added++;
   }
 
-  console.log(`[address-pool] Pool now has ${targetSize} addresses.`);
+  console.log(`[address-pool] Pool now has ${targetSize} addresses (indices ${startIndex}+).`);
 }

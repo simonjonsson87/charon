@@ -25,7 +25,7 @@ import { getLogs, dbLog } from '../../db/logger';
 import type { LogCategory } from '../../db/logger';
 import { checkAll } from '../../monitoring/anomaly';
 import { handleAnomaly } from '../../agent/decisionLayer';
-import { runBoardMeeting } from '../../agent/boardMeeting';
+import { runBoardMeeting, assembleBoardMeetingContext } from '../../agent/boardMeeting';
 import type { AnomalyType } from '../../monitoring/anomaly';
 
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY ?? '';
@@ -99,31 +99,8 @@ export async function adminRoutes(
    * escrow, recent anomalies, and server uptime. Useful for a live demo.
    */
   fastify.get('/status', async () => {
-    const [
-      { getCapitalSummary } ,
-      { getAktBalance, getEscrowBalance },
-    ] = await Promise.all([
-      import('../../agent/tools/capital'),
-      import('../../wallet/akash'),
-    ]);
-
-    const [capital, aktBalance] = await Promise.all([
-      getCapitalSummary(),
-      getAktBalance().catch(() => 'unavailable'),
-    ]);
-
-    let escrow = null;
-    const dseq = process.env.AKASH_DEPLOYMENT_DSEQ;
-    if (dseq) {
-      escrow = await getEscrowBalance(dseq).catch(() => null);
-    }
-
-    return {
-      timestamp: new Date().toISOString(),
-      capital,
-      akash: { aktBalance, escrow },
-      uptime: process.uptime(),
-    };
+    const context = await assembleBoardMeetingContext();
+    return { ...context, uptime: process.uptime() };
   });
 
   // ---- POST /admin/board-meeting -------------------------------------------
@@ -258,22 +235,36 @@ async function dispatchTool(
       return (await ax.post(`${base}/tron/swap-trx`, input, { timeout: 90000 })).data;
     case 'swap_usdt_to_eth_arb':
       return (await ax.post(`${base}/arb/swap-eth`, input, { timeout: 90000 })).data;
+    case 'swap_eth_to_usdt_arb':
+      return (await ax.post(`${base}/arb/swap-usdt`, input, { timeout: 90000 })).data;
+    case 'swap_usdc_to_eth_base':
+      return (await ax.post(`${base}/base/swap-eth`, input, { timeout: 90000 })).data;
+    case 'swap_eth_to_usdc_base':
+      return (await ax.post(`${base}/base/swap-usdc`, input, { timeout: 90000 })).data;
+    case 'swap_tron_trx_for_usdt':
+      return (await ax.post(`${base}/tron/swap-usdt`, input, { timeout: 90000 })).data;
     case 'get_eth_balance_arb':
       return (await ax.get(`${base}/eth-balance`)).data;
     case 'bridge_tron_to_arbitrum':
       return (await ax.post(`${base}/bridge/tron-to-arb`, input, { timeout: 30000 })).data;
-    case 'bridge_base_to_arbitrum':
-      return (await ax.post(`${base}/bridge/base-to-arb`, input, { timeout: 30000 })).data;
     case 'bridge_arbitrum_to_tron':
       return (await ax.post(`${base}/bridge/arb-to-tron`, input, { timeout: 60000 })).data;
     case 'get_symbiosis_tx_status':
       return (await ax.get(`${base}/bridge/symbiosis-status/${input.txHash}`)).data;
+    case 'bridge_tron_to_base':
+      return (await ax.post(`${base}/bridge/tron-to-base`, input, { timeout: 30000 })).data;
+    case 'bridge_base_to_arbitrum':
+      return (await ax.post(`${base}/bridge/base-to-arb`, input, { timeout: 30000 })).data;
     case 'bridge_arbitrum_usdc_to_base':
       return (await ax.post(`${base}/bridge/arb-usdc-to-base`, input, { timeout: 30000 })).data;
     case 'bridge_arbitrum_eth_to_base':
       return (await ax.post(`${base}/bridge/arb-eth-to-base`, input, { timeout: 30000 })).data;
     case 'get_bridge_order_status':
       return (await ax.get(`${base}/bridge/status/${input.orderId}`)).data;
+    case 'bridge_base_usdc_to_akt':
+      return (await ax.post(`${base}/bridge/base-usdc-to-akt`, input, { timeout: 120000 })).data;
+    case 'get_skip_bridge_status':
+      return (await ax.get(`${base}/bridge/skip-status/${input.txHash}`, { params: { chainId: input.chainId ?? '8453' } })).data;
     case 'get_akt_balance':
       return (await ax.get(`${base}/akash/balance`)).data;
     case 'get_akash_escrow_status':

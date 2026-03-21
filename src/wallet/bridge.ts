@@ -20,6 +20,7 @@ import axios from 'axios';
 
 const DEBRIDGE_API  = 'https://dln.debridge.finance/v1.0';
 const SYMBIOSIS_API = 'https://api.symbiosis.finance/crosschain';
+const SKIP_API      = 'https://api.skip.build';
 
 // deBridge chain identifiers — deBridge has no testnet; these are always mainnet values.
 const CHAIN_TRON     = 100000026; // deBridge internal ID — NOT the standard EVM chain ID (728126428)
@@ -398,6 +399,7 @@ export async function getBridgeOrderStatus(orderId: string): Promise<BridgeOrder
 // ---------------------------------------------------------------------------
 
 export interface BridgeQuote {
+  tool: string;            // agent tool name, e.g. "bridge_tron_to_arbitrum"
   route: string;           // human-readable, e.g. "Arbitrum USDT → Tron USDT"
   inputAmount: string;     // total deducted from wallet (transfer + fees), decimal
   outputAmount: string;    // amount received on destination, decimal
@@ -422,6 +424,7 @@ export async function getBridgeQuote(
   dstAuthority: string,
   route: string,
   decimals = 6,
+  tool = '',
 ): Promise<BridgeQuote> {
   const amountSmallest = BigInt(Math.round(parseFloat(amount) * 10 ** decimals)).toString();
 
@@ -463,7 +466,64 @@ export async function getBridgeQuote(
     ? (((inputRaw - outputRaw) * 10000n) / outputRaw / 100n).toString()
     : '?';
 
-  return { route, inputAmount: inputDec, outputAmount: outputDec, feePaidByUser: feeDec, feePct: `${feePct}%`, decimals };
+  return { tool, route, inputAmount: inputDec, outputAmount: outputDec, feePaidByUser: feeDec, feePct: `${feePct}%`, decimals };
+}
+
+/**
+ * getSkipBridgeQuote — Fetch a fee estimate for the Base USDC → Akash AKT route via Skip.
+ *
+ * Read-only; does not broadcast. Uses Skip's /v2/fungible/route endpoint with
+ * a reference amount to get the estimated AKT output and effective exchange rate.
+ *
+ * @param referenceAmountUsdc  Amount to quote (default $10 — enough to show realistic fees)
+ */
+export async function getSkipBridgeQuote(referenceAmountUsdc = '10'): Promise<BridgeQuote> {
+  const amountMicro = BigInt(Math.round(parseFloat(referenceAmountUsdc) * 1_000_000)).toString();
+
+  try {
+    const res = await axios.post(`${SKIP_API}/v2/fungible/route`, {
+      source_asset_denom: USDC_BASE,
+      source_asset_chain_id: '8453',
+      dest_asset_denom: 'uakt',
+      dest_asset_chain_id: 'akashnet-2',
+      amount_in: amountMicro,
+      allow_multi_tx: true,
+      allow_unsafe: false,
+    }, { timeout: 15_000 });
+
+    const data = res.data;
+
+    // amount_out is in uakt (6 decimals, same as USDC).
+    const amountOutUakt = BigInt(data.amount_out ?? 0);
+    const inputUsdc = BigInt(amountMicro);
+    const factor = 1_000_000n;
+
+    const toDecimal = (raw: bigint) =>
+      `${raw / factor}.${(raw % factor).toString().padStart(6, '0')}`;
+
+    // Express fee as USDC cost: use usd_amount_out from Skip if available,
+    // otherwise approximate by comparing input USDC to output value.
+    // usd_amount_out is a float string like "9.234".
+    const usdOut = data.usd_amount_out ? parseFloat(data.usd_amount_out) : null;
+    const inputNum = parseFloat(referenceAmountUsdc);
+    const feePct = usdOut != null && usdOut > 0
+      ? `${(((inputNum - usdOut) / inputNum) * 100).toFixed(2)}%`
+      : '?';
+
+    return {
+      tool: 'bridge_base_usdc_to_akt',
+      route: 'Base USDC → Akash AKT (Skip: Noble→Osmosis swap)',
+      inputAmount: toDecimal(inputUsdc),
+      outputAmount: toDecimal(amountOutUakt), // in AKT (uakt has 6 decimals like USDC)
+      feePaidByUser: usdOut != null ? (inputNum - usdOut).toFixed(6) : '?',
+      feePct,
+      decimals: 6,
+    };
+  } catch (err: unknown) {
+    const axErr = err as { response?: { status?: number; data?: unknown } };
+    const detail = axErr.response?.data ? JSON.stringify(axErr.response.data) : String(err);
+    throw new Error(`[wallet/bridge] Skip quote failed (HTTP ${axErr.response?.status ?? '?'}): ${detail}`);
+  }
 }
 
 /**
@@ -487,16 +547,25 @@ export async function getBridgeFees(referenceAmountUsdt = '100'): Promise<Bridge
   ]);
 
   const routes = [
-    getBridgeQuote(CHAIN_TRON, USDT_TRON, CHAIN_ARBITRUM, USDT_ARBITRUM, referenceAmountUsdt, tronAddress, evmAddress, 'Tron USDT → Arbitrum USDT'),
-    getBridgeQuote(CHAIN_BASE, USDC_BASE, CHAIN_ARBITRUM, USDT_ARBITRUM, referenceAmountUsdt, evmAddress, evmAddress, 'Base USDC → Arbitrum USDT'),
+    getBridgeQuote(CHAIN_TRON, USDT_TRON, CHAIN_ARBITRUM, USDT_ARBITRUM, referenceAmountUsdt, tronAddress, evmAddress, 'Tron USDT → Arbitrum USDT', 6, 'bridge_tron_to_arbitrum'),
+    getBridgeQuote(CHAIN_BASE, USDC_BASE, CHAIN_ARBITRUM, USDT_ARBITRUM, referenceAmountUsdt, evmAddress, evmAddress, 'Base USDC → Arbitrum USDT', 6, 'bridge_base_to_arbitrum'),
     getSymbiosisBridgeQuote(referenceAmountUsdt, evmAddress, tronAddress),
-    getBridgeQuote(CHAIN_ARBITRUM, USDC_ARBITRUM, CHAIN_BASE, USDC_BASE, referenceAmountUsdt, evmAddress, evmAddress, 'Arbitrum USDC → Base USDC'),
+    getBridgeQuote(CHAIN_ARBITRUM, USDC_ARBITRUM, CHAIN_BASE, USDC_BASE, referenceAmountUsdt, evmAddress, evmAddress, 'Arbitrum USDC → Base USDC', 6, 'bridge_arbitrum_usdc_to_base'),
+    getSkipBridgeQuote(referenceAmountUsdt),
+  ];
+
+  const routeNames = [
+    'Tron USDT → Arbitrum USDT',
+    'Base USDC → Arbitrum USDT',
+    'Arbitrum USDT → Tron USDT (Symbiosis)',
+    'Arbitrum USDC → Base USDC',
+    'Base USDC → Akash AKT (Skip: Noble→Osmosis swap)',
   ];
 
   const results = await Promise.allSettled(routes);
   return results
     .map((r, i) => r.status === 'fulfilled' ? r.value : {
-      route: ['Tron USDT → Arbitrum USDT','Base USDC → Arbitrum USDT','Arbitrum USDT → Tron USDT (Symbiosis)','Arbitrum USDC → Base USDC'][i],
+      route: routeNames[i],
       inputAmount: '?', outputAmount: '?', feePaidByUser: '?', feePct: '?', decimals: 6,
       error: r.reason?.message ?? String(r.reason),
     } as unknown as BridgeQuote)
@@ -540,6 +609,7 @@ async function getSymbiosisBridgeQuote(
     : '?';
 
   return {
+    tool: 'bridge_arbitrum_to_tron',
     route: 'Arbitrum USDT → Tron USDT (Symbiosis)',
     inputAmount: toDecimal(inputRaw),
     outputAmount: toDecimal(outputRaw),
@@ -768,6 +838,191 @@ function tronBase58ToEvmHex(base58: string): string {
   const TronWeb = require('tronweb');
   const hex: string = TronWeb.address.toHex(base58); // "41xxxxxxxx..." (42 hex chars)
   return '0x' + hex.slice(2); // strip "41" prefix → 20-byte EVM address
+}
+
+// ---------------------------------------------------------------------------
+// Bridge: Base USDC → Akash AKT (via Skip Protocol)
+// ---------------------------------------------------------------------------
+
+/**
+ * Cosmos chain bech32 prefixes for address derivation.
+ * All Cosmos chains use coin type 118 (m/44'/118'/0'/0/0).
+ */
+const COSMOS_PREFIXES: Record<string, string> = {
+  'noble-1':       'noble',
+  'osmosis-1':     'osmo',
+  'cosmoshub-4':   'cosmos',
+  'axelar-dojo-1': 'axelar',
+  'akashnet-2':    'akash',
+};
+
+/**
+ * Derive a Cosmos bech32 address for the given chain from WDK_SEED_PHRASE.
+ * All Cosmos chains share coin type 118.
+ */
+async function getCosmosAddressForChain(chainId: string): Promise<string> {
+  const prefix = COSMOS_PREFIXES[chainId];
+  if (!prefix) throw new Error(`[wallet/bridge] Unknown Cosmos chain ID: ${chainId}`);
+  const { DirectSecp256k1HdWallet, makeCosmoshubPath } = await import('@cosmjs/proto-signing');
+  const mnemonic = process.env.WDK_SEED_PHRASE;
+  if (!mnemonic) throw new Error('[wallet/bridge] WDK_SEED_PHRASE not set');
+  const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic, {
+    prefix,
+    hdPaths: [makeCosmoshubPath(0)],
+  });
+  const [acct] = await wallet.getAccounts();
+  return acct.address;
+}
+
+export interface SkipTxStatus {
+  txHash: string;
+  chainId: string;
+  status: 'completed' | 'pending' | 'failed' | 'unknown';
+  rawState: string;
+  explorerUrl: string;
+}
+
+/**
+ * bridgeBaseUsdcToAkt — Bridge USDC from Base to AKT on Akash via Skip Protocol.
+ *
+ * Route: Base USDC → (CCTP) → Noble USDC → (IBC) → Osmosis → (swap USDC/AKT) → (IBC) → Akash
+ *
+ * Only the initial Base EVM transaction requires signing. Skip's relayers handle
+ * all IBC transfers and the Osmosis swap automatically.
+ *
+ * Settlement typically takes 10–30 minutes for the full cross-chain route.
+ *
+ * @param amountUsdc  Amount of Base USDC to bridge (decimal string, e.g. "15.00")
+ * @returns           Base tx hash — track with getSkipBridgeStatus
+ */
+export async function bridgeBaseUsdcToAkt(amountUsdc: string): Promise<string> {
+  const evmAddress = await getAgentEvmAddress();
+
+  const { getAkashAddress } = await import('./akash');
+  const akashAddress = await getAkashAddress();
+
+  const amountMicro = BigInt(Math.round(parseFloat(amountUsdc) * 1_000_000)).toString();
+
+  // Step 1: Get optimal route from Skip.
+  let routeRes;
+  try {
+    routeRes = await axios.post(`${SKIP_API}/v2/fungible/route`, {
+      source_asset_denom: USDC_BASE,
+      source_asset_chain_id: '8453',
+      dest_asset_denom: 'uakt',
+      dest_asset_chain_id: 'akashnet-2',
+      amount_in: amountMicro,
+      allow_multi_tx: true,
+      allow_unsafe: false,
+    }, { timeout: 15_000 });
+  } catch (err: unknown) {
+    const axErr = err as { response?: { status?: number; data?: unknown } };
+    const detail = axErr.response?.data ? JSON.stringify(axErr.response.data) : String(err);
+    throw new Error(`[wallet/bridge] Skip route error (HTTP ${axErr.response?.status ?? '?'}): ${detail}`);
+  }
+
+  const route = routeRes.data;
+  const requiredChains: string[] = route.required_chain_addresses ?? ['8453', 'noble-1', 'osmosis-1', 'akashnet-2'];
+
+  // Step 2: Build address map for every chain in the route.
+  const chainAddresses: Record<string, string> = {};
+  for (const chainId of requiredChains) {
+    if (chainId === '8453') {
+      chainAddresses[chainId] = evmAddress;
+    } else if (chainId === 'akashnet-2') {
+      chainAddresses[chainId] = akashAddress;
+    } else {
+      chainAddresses[chainId] = await getCosmosAddressForChain(chainId);
+    }
+  }
+
+  // Step 3: Get transaction messages from Skip.
+  let msgsRes;
+  try {
+    msgsRes = await axios.post(`${SKIP_API}/v2/fungible/msgs`, {
+      source_asset_denom: USDC_BASE,
+      source_asset_chain_id: '8453',
+      dest_asset_denom: 'uakt',
+      dest_asset_chain_id: 'akashnet-2',
+      amount_in: amountMicro,
+      chain_ids_to_addresses: chainAddresses,
+      slippage_tolerance_percent: '3',
+      operations: route.operations,
+    }, { timeout: 15_000 });
+  } catch (err: unknown) {
+    const axErr = err as { response?: { status?: number; data?: unknown } };
+    const detail = axErr.response?.data ? JSON.stringify(axErr.response.data) : String(err);
+    throw new Error(`[wallet/bridge] Skip msgs error (HTTP ${axErr.response?.status ?? '?'}): ${detail}`);
+  }
+
+  // Step 4: Sign and broadcast only the Base EVM transaction.
+  // Skip relays all Cosmos-side hops (Noble, Osmosis swap, Akash delivery) automatically.
+  const txs: Array<{
+    evm_tx?: {
+      chain_id: string;
+      to: string;
+      value: string;
+      data: string;
+      required_erc20_approvals?: Array<{ token_contract: string; spender: string; amount: string }>;
+    };
+    cosmos_tx?: unknown;
+  }> = msgsRes.data.txs ?? [];
+
+  let txHash = '';
+  for (const tx of txs) {
+    if (tx.evm_tx?.chain_id === '8453') {
+      const approvalSpender = tx.evm_tx.required_erc20_approvals?.[0]?.spender;
+      txHash = await broadcastEvmBridgeTx(
+        { to: tx.evm_tx.to, data: tx.evm_tx.data, value: tx.evm_tx.value ?? '0' },
+        CHAIN_BASE,
+        USDC_BASE,
+        approvalSpender,
+      );
+      break;
+    }
+  }
+
+  if (!txHash) throw new Error('[wallet/bridge] Skip: no Base EVM transaction in route response');
+
+  console.log(`[wallet/bridge] ${amountUsdc} USDC Base→AKT Akash (Skip) — txHash: ${txHash}`);
+  return txHash;
+}
+
+/**
+ * getSkipBridgeStatus — Poll the status of a Skip cross-chain transfer.
+ *
+ * @param txHash   The source chain tx hash returned by bridgeBaseUsdcToAkt
+ * @param chainId  Source chain ID (default '8453' for Base)
+ */
+export async function getSkipBridgeStatus(txHash: string, chainId = '8453'): Promise<SkipTxStatus> {
+  try {
+    const res = await axios.get(`${SKIP_API}/v2/tx/status`, {
+      params: { chain_id: chainId, tx_hash: txHash },
+      timeout: 10_000,
+    });
+
+    const transfers: Array<{ state?: string }> = res.data?.transfers ?? [];
+    const rawState: string = transfers.length > 0
+      ? (transfers[transfers.length - 1]?.state ?? 'UNKNOWN')
+      : 'UNKNOWN';
+
+    const s = rawState.toUpperCase();
+    const status: SkipTxStatus['status'] =
+      s.includes('COMPLETED') ? 'completed' :
+      s.includes('ABANDONED') ? 'failed' :
+      (s.includes('PENDING') || s.includes('RECEIVED')) ? 'pending' : 'unknown';
+
+    return {
+      txHash, chainId, status, rawState,
+      explorerUrl: `https://explorer.skip.build/tx/${chainId}/${txHash}`,
+    };
+  } catch (err) {
+    console.warn(`[wallet/bridge] getSkipBridgeStatus(${txHash}) failed:`, err);
+    return {
+      txHash, chainId, status: 'unknown', rawState: 'UNKNOWN',
+      explorerUrl: `https://explorer.skip.build/tx/${chainId}/${txHash}`,
+    };
+  }
 }
 
 function mapDlnStatus(raw: string | undefined): BridgeOrderStatus {

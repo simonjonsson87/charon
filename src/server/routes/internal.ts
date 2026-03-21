@@ -34,16 +34,19 @@ import {
   depositUsdcToAave, withdrawUsdcFromAave,
   getBridgeFeesForAgent,
 } from '../../agent/tools/capital';
-import { swapUsdtForTrx } from '../../wallet/tron';
-import { swapUsdtForEth, getEthBalance } from '../../wallet/evm';
+import { swapUsdtForTrx, swapTrxForUsdt } from '../../wallet/tron';
+import { swapUsdtForEth, swapEthForUsdt, swapUsdcForEth, swapEthForUsdc, getEthBalance } from '../../wallet/evm';
 import {
   bridgeTronToArbitrum,
+  bridgeTronToBase,
   bridgeBaseToArbitrum,
   bridgeArbitrumToTron,
   bridgeArbitrumUsdcToBase,
   bridgeArbitrumEthToBase,
+  bridgeBaseUsdcToAkt,
   getBridgeOrderStatus,
   getSymbiosisOrderStatus,
+  getSkipBridgeStatus,
 } from '../../wallet/bridge';
 import { getAkashAddress, getAktBalance, getEscrowBalance, topUpEscrow } from '../../wallet/akash';
 import type { ExperimentStatus } from '../../db/schema';
@@ -151,15 +154,34 @@ export async function internalRoutes(
     return { txHash, amountUsdt };
   });
 
-  /**
-   * POST /internal/arb/swap-eth
-   * Swap USDT → ETH on Arbitrum via Uniswap v3 to top up the gas buffer.
-   * Body: { amountUsdt: string }
-   */
+  fastify.post('/tron/swap-usdt', async (request) => {
+    const { amountTrx } = request.body as { amountTrx: string };
+    const txHash = await swapTrxForUsdt(amountTrx);
+    return { txHash, amountTrx };
+  });
+
   fastify.post('/arb/swap-eth', async (request) => {
     const { amountUsdt } = request.body as { amountUsdt: string };
     const txHash = await swapUsdtForEth(amountUsdt);
     return { txHash, amountUsdt };
+  });
+
+  fastify.post('/arb/swap-usdt', async (request) => {
+    const { amountEth } = request.body as { amountEth: string };
+    const txHash = await swapEthForUsdt(amountEth);
+    return { txHash, amountEth };
+  });
+
+  fastify.post('/base/swap-eth', async (request) => {
+    const { amountUsdc } = request.body as { amountUsdc: string };
+    const txHash = await swapUsdcForEth(amountUsdc);
+    return { txHash, amountUsdc };
+  });
+
+  fastify.post('/base/swap-usdc', async (request) => {
+    const { amountEth } = request.body as { amountEth: string };
+    const txHash = await swapEthForUsdc(amountEth);
+    return { txHash, amountEth };
   });
 
   /**
@@ -179,6 +201,14 @@ export async function internalRoutes(
   fastify.post('/bridge/tron-to-arb', async (request) => {
     const { amountUsdt } = request.body as { amountUsdt: string };
     const orderId = await bridgeTronToArbitrum(amountUsdt);
+    return { orderId, amountUsdt, explorerUrl: `https://app.debridge.finance/order?orderId=${orderId}` };
+  });
+
+  fastify.post('/bridge/tron-to-base', async (request) => {
+    const { amountUsdt } = request.body as { amountUsdt: string };
+    const { getWalletAddress } = await import('../../wallet/evm');
+    const evmAddress = await getWalletAddress('base');
+    const orderId = await bridgeTronToBase(amountUsdt, evmAddress);
     return { orderId, amountUsdt, explorerUrl: `https://app.debridge.finance/order?orderId=${orderId}` };
   });
 
@@ -204,6 +234,28 @@ export async function internalRoutes(
     const { amountEth } = request.body as { amountEth: string };
     const orderId = await bridgeArbitrumEthToBase(amountEth);
     return { orderId, amountEth, explorerUrl: `https://app.debridge.finance/order?orderId=${orderId}` };
+  });
+
+  /**
+   * POST /internal/bridge/base-usdc-to-akt
+   * Bridge USDC from Base to AKT on Akash via Skip Protocol.
+   * Route: Base → Noble → Osmosis (swap) → Akash.
+   * Body: { amountUsdc: string }
+   */
+  fastify.post('/bridge/base-usdc-to-akt', async (request) => {
+    const { amountUsdc } = request.body as { amountUsdc: string };
+    const txHash = await bridgeBaseUsdcToAkt(amountUsdc);
+    return { txHash, amountUsdc, explorerUrl: `https://explorer.skip.build/tx/8453/${txHash}` };
+  });
+
+  /**
+   * GET /internal/bridge/skip-status/:txHash
+   * Poll the status of a Skip cross-chain transfer.
+   */
+  fastify.get('/bridge/skip-status/:txHash', async (request) => {
+    const { txHash } = request.params as { txHash: string };
+    const { chainId } = request.query as { chainId?: string };
+    return getSkipBridgeStatus(txHash, chainId ?? '8453');
   });
 
   /**

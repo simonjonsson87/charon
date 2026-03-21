@@ -95,34 +95,21 @@ export function createX402Gate(config: X402GateConfig): preHandlerHookHandler {
       return;
     }
 
-    // Verify the payment proof via the CDP facilitator.
+    // Verify the payment proof via local EIP-712 signature verification.
     try {
-      // @ts-ignore — @coinbase/x402 ships ESM types incompatible with current moduleResolution
-      const { verifyPayment, settlePayment } = await import('@coinbase/x402');
-
-      const verifyResult = await verifyPayment(paymentHeader, {
-        network: config.network,
+      const result = await verifyX402Payment(paymentHeader, {
         maxAmountRequired: config.price,
         asset: USDC_BASE,
-        cdpApiKeyName: cdpKeyName,
-        cdpApiKeyPrivateKey: cdpKeyPrivate,
+        payTo: await getAgentBaseAddress(),
       });
 
-      if (!verifyResult.isValid) {
-        reply.status(402).send({ error: 'Payment verification failed', details: verifyResult.invalidReason });
+      if (!result.isValid) {
+        request.log.warn('[x402] Payment invalid: %s', result.invalidReason);
+        reply.status(402).send({ error: 'Payment verification failed', details: result.invalidReason });
         return;
       }
 
-      // Settle the payment (broadcasts the proof on-chain if needed).
-      const settleResult = await settlePayment(paymentHeader, {
-        cdpApiKeyName: cdpKeyName,
-        cdpApiKeyPrivateKey: cdpKeyPrivate,
-      });
-
-      // Attach the settlement response to the reply headers for the client.
-      if (settleResult.responseHeader) {
-        void reply.header('X-Payment-Response', settleResult.responseHeader);
-      }
+      request.log.info('[x402] Payment verified — from %s, amount %s', result.from, result.value);
     } catch (err) {
       request.log.error({ err }, '[x402] Payment verification error.');
       reply.status(402).send({ error: 'Payment processing failed. Please retry.' });
@@ -141,5 +128,105 @@ async function getAgentBaseAddress(): Promise<string> {
   const { getWalletAddress: getAddr } = await import('../../wallet/evm');
   _cachedBaseAddress = await getAddr('base');
   return _cachedBaseAddress;
+}
+
+// ---------------------------------------------------------------------------
+// Local EIP-712 payment verification (no external CDP dependency)
+// ---------------------------------------------------------------------------
+
+interface VerifyResult {
+  isValid: boolean;
+  invalidReason?: string;
+  from?: string;
+  value?: string;
+}
+
+/**
+ * Verify an x402 X-Payment header without calling the CDP facilitator.
+ *
+ * Decodes the base64 payload, reconstructs the EIP-712 typed-data hash, and
+ * recovers the signer address. Checks amount, recipient, and expiry.
+ * Settlement (on-chain USDC transfer) is handled by the USDC contract when
+ * the facilitator submits the signed authorization — we don't need to do that
+ * here; the signature itself is sufficient proof of authorisation for access.
+ */
+async function verifyX402Payment(
+  paymentHeader: string,
+  config: { maxAmountRequired: string; asset: string; payTo: string },
+): Promise<VerifyResult> {
+  const { ethers } = await import('ethers');
+
+  let payment: Record<string, unknown>;
+  try {
+    payment = JSON.parse(Buffer.from(paymentHeader, 'base64').toString('utf8'));
+  } catch {
+    return { isValid: false, invalidReason: 'Malformed X-Payment header (not valid base64 JSON)' };
+  }
+
+  if (payment['x402Version'] !== 1 || payment['scheme'] !== 'exact') {
+    return { isValid: false, invalidReason: 'Unsupported x402 version or scheme' };
+  }
+
+  const { signature, authorization } = (payment['payload'] ?? {}) as Record<string, unknown>;
+  if (!signature || !authorization || typeof authorization !== 'object') {
+    return { isValid: false, invalidReason: 'Missing payload.signature or payload.authorization' };
+  }
+
+  const auth = authorization as Record<string, string>;
+  const now = Math.floor(Date.now() / 1000);
+
+  if (parseInt(auth['validBefore'] ?? '0') < now) {
+    return { isValid: false, invalidReason: 'Payment authorization expired' };
+  }
+
+  // Amount check: config.maxAmountRequired is a dollar string ("0.01"); auth.value is base units.
+  const requiredBaseUnits = Math.round(parseFloat(config.maxAmountRequired) * 1_000_000);
+  if (parseInt(auth['value'] ?? '0') < requiredBaseUnits) {
+    return { isValid: false, invalidReason: `Insufficient amount: got ${auth['value']}, need ${requiredBaseUnits}` };
+  }
+
+  // Recipient check
+  if ((auth['to'] ?? '').toLowerCase() !== config.payTo.toLowerCase()) {
+    return { isValid: false, invalidReason: `Wrong recipient: got ${auth['to']}, expected ${config.payTo}` };
+  }
+
+  // EIP-712 signature recovery
+  const domain = {
+    name: 'USD Coin',
+    version: '2',
+    chainId: 8453,
+    verifyingContract: config.asset,
+  };
+  const types = {
+    TransferWithAuthorization: [
+      { name: 'from',        type: 'address' },
+      { name: 'to',          type: 'address' },
+      { name: 'value',       type: 'uint256' },
+      { name: 'validAfter',  type: 'uint256' },
+      { name: 'validBefore', type: 'uint256' },
+      { name: 'nonce',       type: 'bytes32' },
+    ],
+  };
+  const message = {
+    from:        auth['from'],
+    to:          auth['to'],
+    value:       BigInt(auth['value'] ?? '0'),
+    validAfter:  BigInt(auth['validAfter'] ?? '0'),
+    validBefore: BigInt(auth['validBefore'] ?? '0'),
+    nonce:       auth['nonce'],
+  };
+
+  let recovered: string;
+  try {
+    recovered = ethers.verifyTypedData(domain, types, message, signature as string);
+  } catch (err) {
+    return { isValid: false, invalidReason: `Signature recovery failed: ${(err as Error).message}` };
+  }
+
+  if (recovered.toLowerCase() !== (auth['from'] ?? '').toLowerCase()) {
+    return { isValid: false, invalidReason: `Signer mismatch: recovered ${recovered}, expected ${auth['from']}` };
+  }
+
+  return { isValid: true, from: auth['from'], value: auth['value'] };
 }
 

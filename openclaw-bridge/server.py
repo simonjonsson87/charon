@@ -611,6 +611,47 @@ RELAY_OPS_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "deposit_usdc_to_aave",
+            "description": (
+                "Deposit USDC from Arbitrum into Aave lending pool. "
+                "Use when liquid USDC on Arbitrum exceeds operational needs and Aave APY > 2%. "
+                "Call save_experiment first if deposit is >10% of the current Aave USDC position."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountUsdc": {
+                        "type": "string",
+                        "description": "Decimal string amount, e.g. '10.00'. Minimum: 1 USDC.",
+                    }
+                },
+                "required": ["amountUsdc"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "withdraw_usdc_from_aave",
+            "description": (
+                "Withdraw USDC from Aave back to liquid balance on Arbitrum. "
+                "Only for operational reasons. Use 'MAX' to withdraw the full position."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountUsdc": {
+                        "type": "string",
+                        "description": "Decimal string amount, or 'MAX' for full withdrawal.",
+                    }
+                },
+                "required": ["amountUsdc"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "swap_tron_usdt_for_trx",
             "description": (
                 "Swap USDT for native TRX on Tron via SunSwap v2 to top up the energy sponsorship reserve. "
@@ -708,6 +749,276 @@ RELAY_OPS_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "swap_eth_to_usdt_arb",
+            "description": (
+                "Swap native ETH on Arbitrum for USDT via Uniswap v3. "
+                "Use when the ETH gas buffer on Arbitrum exceeds what is needed and "
+                "the agent wants to redeploy excess into productive USDT for Aave. "
+                "Small amounts only — do not drain the gas buffer below 0.005 ETH."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountEth": {
+                        "type": "string",
+                        "description": "Amount of ETH to swap, e.g. '0.003'.",
+                    }
+                },
+                "required": ["amountEth"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "swap_usdc_to_eth_base",
+            "description": (
+                "Swap USDC on Base for native ETH via Uniswap v3. "
+                "Use when Base ETH is depleted and needed for deBridge protocol gas fees. "
+                "Small amounts only (1–5 USDC). Never let Base USDC drop below $1.00."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountUsdc": {
+                        "type": "string",
+                        "description": "Amount of USDC to swap, e.g. '2.00'.",
+                    }
+                },
+                "required": ["amountUsdc"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "swap_eth_to_usdc_base",
+            "description": (
+                "Swap native ETH on Base for USDC via Uniswap v3. "
+                "Use when Base ETH exceeds the gas buffer and the agent wants to "
+                "convert the excess into USDC for inference payments or bridging."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountEth": {
+                        "type": "string",
+                        "description": "Amount of ETH to swap, e.g. '0.001'.",
+                    }
+                },
+                "required": ["amountEth"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "swap_tron_trx_for_usdt",
+            "description": (
+                "Swap native TRX for USDT on Tron via SunSwap v2. "
+                "Use when the TRX reserve significantly exceeds operational needs "
+                "and the agent wants to redeploy excess into productive USDT. "
+                "Always keep at least 25 TRX in reserve for energy sponsorship."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountTrx": {
+                        "type": "string",
+                        "description": "Amount of TRX to swap, e.g. '50'.",
+                    }
+                },
+                "required": ["amountTrx"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bridge_arbitrum_to_tron",
+            "description": (
+                "Bridge USDT from Arbitrum back to Tron via Symbiosis Finance (~0.4% fee). "
+                "Use when Tron USDT float is too low to cover expected payment volume and "
+                "bridging from Arbitrum is cheaper than waiting for new relay revenue. "
+                "Returns an Arbitrum tx hash — call get_symbiosis_tx_status to track completion. "
+                "Minimum useful amount: 10 USDT (Symbiosis has a minimum threshold). "
+                "Settlement typically takes 5–15 minutes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountUsdt": {
+                        "type": "string",
+                        "description": "Amount of Arbitrum USDT to bridge, e.g. '50.00'.",
+                    }
+                },
+                "required": ["amountUsdt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_symbiosis_tx_status",
+            "description": (
+                "Poll the status of a Symbiosis Arbitrum→Tron transfer by Arbitrum tx hash. "
+                "Call after bridge_arbitrum_to_tron to track completion. "
+                "Status codes: 0=completed, 1=pending, 2=stucked, 3=reverted."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "txHash": {
+                        "type": "string",
+                        "description": "The Arbitrum tx hash returned by bridge_arbitrum_to_tron.",
+                    }
+                },
+                "required": ["txHash"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bridge_tron_to_base",
+            "description": (
+                "Bridge USDT from Tron to Base as USDC via deBridge DLN. "
+                "Use when Base USDC is low and needs replenishment for x402 inference payments. "
+                "Returns a deBridge orderId — call get_bridge_order_status to track completion. "
+                "Only bridge amounts above the Tron minimum float. Minimum bridge: 10 USDT."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountUsdt": {
+                        "type": "string",
+                        "description": "Amount of Tron USDT to bridge, e.g. '20.00'.",
+                    }
+                },
+                "required": ["amountUsdt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bridge_base_to_arbitrum",
+            "description": (
+                "Bridge USDC from Base to USDT on Arbitrum via deBridge DLN. "
+                "Use when Arbitrum USDT is low and Base USDC has excess beyond inference needs. "
+                "Returns a deBridge orderId — call get_bridge_order_status to track completion. "
+                "Never bridge Base USDC below $1.00 — that balance funds inference payments."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountUsdc": {
+                        "type": "string",
+                        "description": "Amount of Base USDC to bridge, e.g. '10.00'.",
+                    }
+                },
+                "required": ["amountUsdc"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bridge_arbitrum_usdc_to_base",
+            "description": (
+                "Bridge USDC from Arbitrum to Base via deBridge DLN. "
+                "Use when Base USDC needs replenishment for x402 inference payments and "
+                "Arbitrum has excess USDC. "
+                "Returns a deBridge orderId — call get_bridge_order_status to track completion."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountUsdc": {
+                        "type": "string",
+                        "description": "Amount of Arbitrum USDC to bridge, e.g. '5.00'.",
+                    }
+                },
+                "required": ["amountUsdc"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bridge_arbitrum_eth_to_base",
+            "description": (
+                "Bridge native ETH from Arbitrum to Base via deBridge DLN. "
+                "Use when Base ETH gas buffer is depleted (needed for deBridge protocol fees on Base). "
+                "Returns a deBridge orderId — call get_bridge_order_status to track completion. "
+                "Small amounts only (0.001–0.005 ETH). Do not bridge more than needed for gas."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountEth": {
+                        "type": "string",
+                        "description": "Amount of ETH to bridge, e.g. '0.002'.",
+                    }
+                },
+                "required": ["amountEth"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bridge_base_usdc_to_akt",
+            "description": (
+                "Bridge USDC from Base to AKT on Akash Network via Skip Protocol. "
+                "Route: Base USDC → Noble → Osmosis (swap USDC/AKT) → Akash. "
+                "Use when AKT wallet balance is too low to top up the Akash escrow. "
+                "Only the initial Base EVM transaction is signed — Skip relayers handle all Cosmos hops automatically. "
+                "Returns a Base tx hash — call get_skip_bridge_status to track settlement. "
+                "Minimum useful amount: 5 USDC (covers Skip fees and gas). "
+                "Allow 10–30 minutes for full settlement before topping up escrow."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amountUsdc": {
+                        "type": "string",
+                        "description": "Amount of Base USDC to bridge, e.g. '15.00'. Minimum 5 USDC.",
+                    }
+                },
+                "required": ["amountUsdc"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_skip_bridge_status",
+            "description": (
+                "Poll the status of a Skip cross-chain transfer. "
+                "Call after bridge_base_usdc_to_akt to track when AKT lands on Akash. "
+                "Status values: completed, pending, failed, unknown. "
+                "Settlement typically takes 10–30 minutes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "txHash": {
+                        "type": "string",
+                        "description": "The Base tx hash returned by bridge_base_usdc_to_akt.",
+                    },
+                    "chainId": {
+                        "type": "string",
+                        "description": "Source chain ID. Default '8453' for Base.",
+                    },
+                },
+                "required": ["txHash"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_akt_balance",
             "description": (
                 "Return the agent's AKT wallet balance on the Akash Network. "
@@ -799,6 +1110,8 @@ RELAY_OPS_TOOLS: list[dict] = [
 def execute_tool(tool_name: str, tool_input: dict) -> Any:
     base = RELAY_INTERNAL_URL
 
+    log.info("[tool:%s] input=%s", tool_name, json.dumps(tool_input)[:300])
+
     try:
         if tool_name == "get_metrics":
             r = requests.get(f"{base}/metrics", params={"days": tool_input["days"]}, timeout=10)
@@ -837,11 +1150,29 @@ def execute_tool(tool_name: str, tool_input: dict) -> Any:
         elif tool_name == "withdraw_from_aave":
             r = requests.post(f"{base}/aave/withdraw", json=tool_input, timeout=30)
 
+        elif tool_name == "deposit_usdc_to_aave":
+            r = requests.post(f"{base}/aave/deposit-usdc", json=tool_input, timeout=30)
+
+        elif tool_name == "withdraw_usdc_from_aave":
+            r = requests.post(f"{base}/aave/withdraw-usdc", json=tool_input, timeout=30)
+
         elif tool_name == "swap_tron_usdt_for_trx":
             r = requests.post(f"{base}/tron/swap-trx", json=tool_input, timeout=60)
 
         elif tool_name == "swap_usdt_to_eth_arb":
             r = requests.post(f"{base}/arb/swap-eth", json=tool_input, timeout=60)
+
+        elif tool_name == "swap_eth_to_usdt_arb":
+            r = requests.post(f"{base}/arb/swap-usdt", json=tool_input, timeout=60)
+
+        elif tool_name == "swap_usdc_to_eth_base":
+            r = requests.post(f"{base}/base/swap-eth", json=tool_input, timeout=60)
+
+        elif tool_name == "swap_eth_to_usdc_base":
+            r = requests.post(f"{base}/base/swap-usdc", json=tool_input, timeout=60)
+
+        elif tool_name == "swap_tron_trx_for_usdt":
+            r = requests.post(f"{base}/tron/swap-usdt", json=tool_input, timeout=60)
 
         elif tool_name == "get_eth_balance_arb":
             r = requests.get(f"{base}/eth-balance", timeout=10)
@@ -849,9 +1180,36 @@ def execute_tool(tool_name: str, tool_input: dict) -> Any:
         elif tool_name == "bridge_tron_to_arbitrum":
             r = requests.post(f"{base}/bridge/tron-to-arb", json=tool_input, timeout=30)
 
+        elif tool_name == "bridge_arbitrum_to_tron":
+            r = requests.post(f"{base}/bridge/arb-to-tron", json=tool_input, timeout=60)
+
+        elif tool_name == "get_symbiosis_tx_status":
+            tx_hash = tool_input["txHash"]
+            r = requests.get(f"{base}/bridge/symbiosis-status/{tx_hash}", timeout=10)
+
+        elif tool_name == "bridge_tron_to_base":
+            r = requests.post(f"{base}/bridge/tron-to-base", json=tool_input, timeout=30)
+
+        elif tool_name == "bridge_base_to_arbitrum":
+            r = requests.post(f"{base}/bridge/base-to-arb", json=tool_input, timeout=30)
+
+        elif tool_name == "bridge_arbitrum_usdc_to_base":
+            r = requests.post(f"{base}/bridge/arb-usdc-to-base", json=tool_input, timeout=30)
+
+        elif tool_name == "bridge_arbitrum_eth_to_base":
+            r = requests.post(f"{base}/bridge/arb-eth-to-base", json=tool_input, timeout=30)
+
         elif tool_name == "get_bridge_order_status":
             order_id = tool_input["orderId"]
             r = requests.get(f"{base}/bridge/status/{order_id}", timeout=10)
+
+        elif tool_name == "bridge_base_usdc_to_akt":
+            r = requests.post(f"{base}/bridge/base-usdc-to-akt", json=tool_input, timeout=60)
+
+        elif tool_name == "get_skip_bridge_status":
+            tx_hash = tool_input["txHash"]
+            chain_id = tool_input.get("chainId", "8453")
+            r = requests.get(f"{base}/bridge/skip-status/{tx_hash}", params={"chainId": chain_id}, timeout=10)
 
         elif tool_name == "get_akt_balance":
             r = requests.get(f"{base}/akash/balance", timeout=10)
@@ -864,16 +1222,29 @@ def execute_tool(tool_name: str, tool_input: dict) -> Any:
             r = requests.post(f"{base}/akash/escrow/topup", json=tool_input, timeout=60)
 
         elif tool_name == "update_memory":
-            return _append_memory(tool_input["content"])
+            result = _append_memory(tool_input["content"])
+            log.info("[tool:update_memory] result=%s", result)
+            return result
 
         else:
+            log.warning("[tool:%s] unknown tool", tool_name)
             return {"error": f"Unknown tool: {tool_name}"}
 
         r.raise_for_status()
-        return r.json()
+        result = r.json()
+
+        # Log result, highlighting transaction hashes prominently.
+        tx_fields = ["txHash", "orderId", "txid", "hash"]
+        tx_values = {k: result[k] for k in tx_fields if k in result}
+        if tx_values:
+            log.info("[tool:%s] %s", tool_name, "  ".join(f"{k}={v}" for k, v in tx_values.items()))
+        else:
+            log.info("[tool:%s] result=%s", tool_name, json.dumps(result)[:300])
+
+        return result
 
     except requests.RequestException as exc:
-        log.error("Tool %s HTTP call failed: %s", tool_name, exc)
+        log.error("[tool:%s] HTTP call failed: %s", tool_name, exc)
         return {"error": str(exc)}
 
 

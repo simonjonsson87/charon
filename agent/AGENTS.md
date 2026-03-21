@@ -122,8 +122,14 @@ Calculate average daily volume from `get_metrics(7)` (7-day rolling average).
   - Typical bid for 0.5 vCPU / 512Mi: 50–200 uakt/block → 21–86 AKT/month (~$21–172 at $1–2/AKT).
 - **Top-up target**: always maintain ≥ 3 months of runway in escrow.
 - If `akash_escrow_low` fires (< 1.5 months remaining): call `topup_akash_escrow` to restore 3 months.
-- If AKT wallet balance is < 2 AKT: log a warning that manual AKT purchase is required; no automated action possible.
-- AKT must be acquired externally (Osmosis DEX or Kraken/Binance) and sent to the `get_akt_balance` address. The agent cannot automatically swap USDT → AKT (no bridge exists yet).
+- If AKT wallet balance is insufficient to top up the escrow:
+  1. Call `bridge_base_usdc_to_akt` with enough USDC to cover 3 months of runway plus a buffer.
+     - Estimate needed AKT: `3 × monthlyBurnAkt` from `get_akash_escrow_status`.
+     - AKT price fluctuates; use 15 USDC per AKT as a conservative estimate unless you have fresher data.
+     - Minimum useful bridge: 5 USDC. Never bridge more than 50% of `liquidUsdcBase` in a single call.
+  2. Track with `get_skip_bridge_status(txHash)` — settlement takes 10–30 minutes.
+  3. Once status is `completed`, call `get_akt_balance` to confirm the AKT arrived, then `topup_akash_escrow`.
+- If `liquidUsdcBase` is too low to bridge (< 5 USDC), log a critical alert — manual intervention required.
 
 ### Capital Safety Rules
 - Never withdraw from Aave for non-operational reasons.

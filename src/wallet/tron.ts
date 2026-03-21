@@ -21,9 +21,17 @@
 const TronWeb = require('tronweb');
 import axios from 'axios';
 
-// USDT TRC-20 contract — override via env to use a test token on Shasta.
-// NOTE: Shasta testnet has no official USDT. Deploy a test TRC-20 and set its address here.
-const USDT_CONTRACT = process.env.TRON_USDT_CONTRACT ?? 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+// USDT TRC-20 contract — primary contract for swaps, approvals, and balance checks.
+// Declared as `let` and populated in initTronWallet() so that the value is read
+// AFTER dotenv has loaded process.env (module-level consts are evaluated at import
+// time, before dotenv runs, causing the env var to be silently ignored).
+let USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+
+// Accepted USDT contracts for INBOUND payment detection. Also populated at init.
+let ACCEPTED_USDT_CONTRACTS: Set<string> = new Set([
+  'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
+  'TG3XXyExBkPp9nzdajDZsozEu4BkaSJozs',
+]);
 
 // SunSwap v2 — not deployed on Shasta. Set env var to empty string to disable swaps on testnet.
 const SUNSWAP_V2_ROUTER = process.env.TRON_SUNSWAP_ROUTER ?? 'TKzxdSv2FZKQrEqkKVgp5DcwEXBEKMg2Ax';
@@ -41,6 +49,9 @@ let tronWeb: typeof TronWeb | null = null;
 
 // Mnemonic stored in memory for key derivation
 let mnemonic: string | null = null;
+
+// Hot wallet address (index 0) — used as the caller for constant contract calls.
+let hotWalletAddress: string | null = null;
 
 // ---------------------------------------------------------------------------
 // Initialisation
@@ -70,6 +81,22 @@ export async function initTronWallet(): Promise<void> {
   });
 
   mnemonic = seed;
+
+  // Read USDT contract from env now that dotenv has run.
+  USDT_CONTRACT = process.env.TRON_USDT_CONTRACT ?? 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+  ACCEPTED_USDT_CONTRACTS = new Set([
+    USDT_CONTRACT,
+    'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
+    'TG3XXyExBkPp9nzdajDZsozEu4BkaSJozs',
+  ]);
+  console.log(`[wallet/tron] USDT contract: ${USDT_CONTRACT}`);
+
+  // Derive index 0 (hot wallet) and set as TronWeb's default address.
+  // triggerConstantContract requires a default address to be set on the instance.
+  const hotAccount = TronWeb.fromMnemonic(seed, TRON_BIP44_PATH(0));
+  hotWalletAddress = hotAccount.address as string;
+  tronWeb.setAddress(hotWalletAddress);
+
   console.log('[wallet/tron] Wallet initialised.');
 }
 
@@ -111,20 +138,93 @@ function derivePrivateKey(index: number): string {
 // Balances
 // ---------------------------------------------------------------------------
 
+// Minimal ABI for balanceOf — used by getBalance().
+const BALANCE_OF_ABI = [
+  {
+    inputs:  [{ internalType: 'address', name: 'account', type: 'address' }],
+    name:    'balanceOf',
+    outputs: [{ internalType: 'uint256', name: '',        type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function',
+  },
+];
+
 /**
  * getBalance — Get the USDT TRC-20 balance for any TRON address.
  *
- * Returns the balance as a decimal string (e.g., "123.456789").
+ * Uses TronWeb's contract() API (higher-level than triggerConstantContract)
+ * to call balanceOf() on the USDT contract. The balance lives in contract
+ * storage so this works regardless of whether the address is activated.
+ *
+ * Falls back to the REST /v1/accounts endpoint if the contract call fails
+ * (useful when the address is activated and the contract is indexed).
+ *
+ * Returns the balance as a decimal string (e.g. "123.456789").
  * USDT on TRON has 6 decimal places.
  */
 export async function getBalance(address: string): Promise<string> {
+  if (!tronWeb) throw new Error('[wallet/tron] Wallet not initialised.');
+
+  // Primary: contract().balanceOf().call() — uses /wallet/triggersmartcontract
+  // which is more broadly supported than /wallet/triggerconstantcontract.
+  try {
+    const contract = await tronWeb.contract(BALANCE_OF_ABI, USDT_CONTRACT);
+    const raw = await contract.balanceOf(address).call();
+    // TronWeb may return a BigNumber, a string, or a plain number depending on version.
+    const rawNum = typeof raw === 'object'
+      ? (raw.toNumber?.() ?? parseInt(raw.toString(), 10))
+      : Number(raw);
+    return (rawNum / 1_000_000).toFixed(6);
+  } catch (primaryErr: unknown) {
+    const msg = typeof primaryErr === 'string' ? primaryErr
+      : (primaryErr as { message?: string })?.message
+      ?? JSON.stringify(primaryErr);
+    console.warn(
+      `[wallet/tron] getBalance primary (contract API) failed for ${address}` +
+      ` on contract ${USDT_CONTRACT}: ${msg}` +
+      ` — falling back to REST`,
+    );
+  }
+
+  // Fallback: REST /v1/accounts — works for activated addresses.
+  try {
+    const headers: Record<string, string> = {};
+    if (apiKey) headers['TRON-PRO-API-KEY'] = apiKey;
+
+    const res = await axios.get(
+      `${tronGridUrl}/v1/accounts/${address}`,
+      { headers, timeout: 5000 },
+    );
+
+    const trc20: Record<string, string>[] = res.data?.data?.[0]?.trc20 ?? [];
+    const entry = trc20.find((b) => ACCEPTED_USDT_CONTRACTS.has(Object.keys(b)[0]));
+    if (entry) {
+      const raw = parseInt(Object.values(entry)[0], 10);
+      return (raw / 1_000_000).toFixed(6);
+    }
+    return '0.000000';
+  } catch (fallbackErr: unknown) {
+    const msg = typeof fallbackErr === 'string' ? fallbackErr
+      : (fallbackErr as { message?: string })?.message
+      ?? JSON.stringify(fallbackErr);
+    console.error(
+      `[wallet/tron] getBalance fallback (REST) also failed for ${address}: ${msg}`,
+    );
+    return '0.000000';
+  }
+}
+
+/**
+ * getBalanceLegacy — TronGrid REST fallback (unreliable for unactivated addresses).
+ * Kept for reference; not used in the monitor hot path.
+ */
+async function getBalanceLegacy(address: string): Promise<string> {
   if (!tronWeb) throw new Error('[wallet/tron] Wallet not initialised.');
 
   try {
     const headers: Record<string, string> = {};
     if (apiKey) headers['TRON-PRO-API-KEY'] = apiKey;
 
-    // Use TronGrid v1 REST API for TRC-20 balance (more reliable than triggerConstantContract).
     const res = await axios.get(
       `${tronGridUrl}/v1/accounts/${address}`,
       { headers, timeout: 5000 },
@@ -192,10 +292,11 @@ export async function getTransferEvents(
       {
         headers,
         params: {
-          only_confirmed: true,
-          contract_address: USDT_CONTRACT,
-          limit: 200,
-          min_timestamp: sinceTimestamp,
+          // No only_confirmed — TRON requires 19/27 SRs; we do our own confirmation
+          // counting. No min_timestamp — TronGrid's handling of this param is
+          // unreliable for unactivated addresses; we filter by timestamp in JS below.
+          // No contract_address — accept any USDT contract (see ACCEPTED_USDT_CONTRACTS).
+          limit: 50,
         },
         timeout: 8000,
       },
@@ -207,13 +308,18 @@ export async function getTransferEvents(
       to: string;
       value: string;
       block_timestamp: number;
-      token_info?: { decimals?: number };
+      token_info?: { address?: string; symbol?: string; decimals?: number };
     };
 
     const txs: TronGridTx[] = res.data?.data ?? [];
 
+
     return txs
-      .filter((tx) => tx.to.toLowerCase() === address.toLowerCase())
+      .filter((tx) =>
+        tx.to.toLowerCase() === address.toLowerCase() &&
+        tx.block_timestamp >= sinceTimestamp &&
+        ACCEPTED_USDT_CONTRACTS.has(tx.token_info?.address ?? ''),
+      )
       .map((tx) => ({
         txHash: tx.transaction_id,
         fromAddress: tx.from,
@@ -335,6 +441,84 @@ export async function swapUsdtForTrx(
 
   // Return swap tx hash so the caller can display it. Actual TRX received
   // can be read from the agent's TRX balance after confirmation.
+  return txHash;
+}
+
+// ---------------------------------------------------------------------------
+// SunSwap v2 — TRX → USDT swap (redeploy TRX reserve back to USDT)
+// ---------------------------------------------------------------------------
+
+/**
+ * swapTrxForUsdt — Swap native TRX for USDT using SunSwap v2 on Tron.
+ *
+ * Reverse of swapUsdtForTrx. Used when the TRX reserve is larger than needed
+ * and the agent wants to redeploy excess into productive USDT.
+ * Calls `swapExactETHForTokens` on SunSwap v2 (the native-token→ERC20 variant).
+ *
+ * @param amountTrx   Amount of TRX to swap, as a decimal string (e.g. "50")
+ * @param slippagePct Maximum acceptable slippage percentage (default 1.0)
+ * @returns           Transaction hash
+ */
+export async function swapTrxForUsdt(
+  amountTrx: string,
+  slippagePct = 1.0,
+): Promise<string> {
+  if (!tronWeb || !mnemonic) throw new Error('[wallet/tron] Wallet not initialised.');
+
+  const privateKey = derivePrivateKey(0);
+  const fromAddress = await deriveAddress(0);
+
+  const headers: Record<string, string> = {};
+  if (apiKey) headers['TRON-PRO-API-KEY'] = apiKey;
+
+  const signerWeb = new TronWeb({ fullHost: tronGridUrl, headers, privateKey });
+
+  // TRX uses 6 decimals (1 TRX = 1,000,000 SUN).
+  const amountSun = Math.round(parseFloat(amountTrx) * 1_000_000);
+  const deadlineTs = Math.floor(Date.now() / 1000) + 300;
+  const path = [WTRX_CONTRACT, USDT_CONTRACT];
+
+  // Get expected output from SunSwap (read-only).
+  const quoteResult = await signerWeb.transactionBuilder.triggerConstantContract(
+    SUNSWAP_V2_ROUTER,
+    'getAmountsOut(uint256,address[])',
+    {},
+    [
+      { type: 'uint256', value: amountSun },
+      { type: 'address[]', value: path },
+    ],
+    fromAddress,
+  );
+
+  const hex: string = quoteResult.constant_result?.[0] ?? '';
+  if (hex.length < 256) {
+    throw new Error(`[wallet/tron] SunSwap getAmountsOut returned unexpected data: ${hex}`);
+  }
+  const amountOutExpected = BigInt('0x' + hex.slice(192, 256));
+  const amountOutMin = amountOutExpected * BigInt(Math.round((100 - slippagePct) * 100)) / BigInt(10000);
+
+  // swapExactETHForTokens — native TRX in, USDT out. callValue = amountSun.
+  const { transaction: swapTx } = await signerWeb.transactionBuilder.triggerSmartContract(
+    SUNSWAP_V2_ROUTER,
+    'swapExactETHForTokens(uint256,address[],address,uint256)',
+    { feeLimit: 150_000_000, callValue: amountSun, from: fromAddress },
+    [
+      { type: 'uint256', value: amountOutMin },
+      { type: 'address[]', value: path },
+      { type: 'address', value: fromAddress },
+      { type: 'uint256', value: deadlineTs },
+    ],
+    fromAddress,
+  );
+
+  const signedSwap = await signerWeb.trx.sign(swapTx, privateKey);
+  const swapResult = await signerWeb.trx.sendRawTransaction(signedSwap);
+  if (!swapResult.result) {
+    throw new Error(`[wallet/tron] SunSwap TRX→USDT failed: ${JSON.stringify(swapResult)}`);
+  }
+
+  const txHash: string = swapResult.txid ?? swapResult.transaction?.txID;
+  console.log(`[wallet/tron] SunSwap: ${amountTrx} TRX → USDT. TX: ${txHash}`);
   return txHash;
 }
 

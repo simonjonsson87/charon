@@ -36,11 +36,12 @@ import axios from 'axios';
 import { getActivePayments, updatePaymentStatus } from '../db/queries/payments';
 import { recordConfirmation } from '../db/queries/confirmations';
 import { getDeveloperById } from '../db/queries/developers';
-import { getTransferEvents } from '../wallet/tron';
+import { getTransferEvents, getBalance } from '../wallet/tron';
 import { forwardPayment } from '../wallet/tron';
 import { bridgeTronToBase, getBridgeOrderStatus } from '../wallet/bridge';
 import { releaseAddress } from './addressPool';
 import { sponsorIfNeeded } from './gasless';
+import { activateIfNeeded } from '../wallet/tronGasfree';
 import { deliverWebhook } from './webhook';
 import type { Payment } from '../db/schema';
 
@@ -129,6 +130,18 @@ async function pollPayments(): Promise<void> {
       // last 60 seconds — critical for survivng restarts during active payments.
       if (!lastPolledAt.has(payment.address)) {
         lastPolledAt.set(payment.address, new Date(payment.created_at).getTime());
+        const contract = process.env.TRON_USDT_CONTRACT ?? 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+        console.log(
+          `[monitor] Now watching ${payment.address} for ≥${payment.amount_due} USDT` +
+          ` (contract: ${contract}) — payment ${payment.id}`,
+        );
+        // Proactively activate the address so it can broadcast transactions when
+        // it's time to forward. Unactivated addresses can't sign TXs. Firing now
+        // (before the user sends USDT) means activation is done by the time funds
+        // arrive. Fire-and-forget — don't block the first poll cycle.
+        activateIfNeeded(payment.address).catch((err) =>
+          console.error(`[monitor] Proactive activation failed for ${payment.address}:`, err),
+        );
       }
       await checkPayment(payment);
     } catch (err) {
@@ -154,22 +167,24 @@ async function checkPayment(payment: Payment): Promise<void> {
 }
 
 /**
- * checkForIncomingTransfer — Look for new USDT arriving at a pending payment address.
+ * checkForIncomingTransfer — Detect USDT arriving at a pending payment address.
  *
- * Queries TronGrid for TRC-20 Transfer events targeting this address since
- * the last poll. If a transfer with amount >= amountDue is found, transitions
- * the payment to 'detected' and triggers energy sponsorship if needed.
+ * Uses balance polling rather than TronGrid event queries. TronGrid's
+ * /transactions/trc20 endpoint returns nothing for unactivated addresses
+ * (addresses that have only ever received TRC-20 tokens, never TRX). Balance
+ * polling via /v1/accounts/{address} works regardless of activation status.
+ *
+ * Once a sufficient balance is detected, transitions to 'detected' and attempts
+ * to look up the inbound tx hash from the event log (best-effort — forwarding
+ * does not require the hash).
  */
 async function checkForIncomingTransfer(payment: Payment): Promise<void> {
-  const sinceTimestamp = lastPolledAt.get(payment.address) ?? Date.now() - 60_000;
-
-  // Skip polling if we're in a rate-limit backoff window.
   if (Date.now() < rateLimitBackoffUntil) return;
 
-  let events;
+  let balanceStr: string;
   try {
-    events = await getTransferEvents(payment.address, sinceTimestamp);
-    rateLimitConsecutive = 0; // reset on success
+    balanceStr = await getBalance(payment.address);
+    rateLimitConsecutive = 0;
   } catch (err: unknown) {
     const status = (err as { response?: { status?: number } })?.response?.status;
     if (status === 429) {
@@ -181,30 +196,28 @@ async function checkForIncomingTransfer(payment: Payment): Promise<void> {
     }
     throw err;
   }
-  lastPolledAt.set(payment.address, Date.now());
 
-  for (const event of events) {
-    const received = parseFloat(event.amount);
-    const due = parseFloat(payment.amount_due);
+  const balance = parseFloat(balanceStr);
+  const due     = parseFloat(payment.amount_due);
 
-    if (received < due) {
-      // Under-payment: do not accept. Log for visibility.
-      console.warn(
-        `[monitor] Under-payment on ${payment.id}: received ${received}, due ${due}. Ignoring.`,
-      );
-      continue;
-    }
+  if (balance < due) return; // Not yet paid.
 
-    console.log(`[monitor] Payment ${payment.id} detected. TX: ${event.txHash}`);
-
-    // Transition to detected.
-    updatePaymentStatus(payment.id, 'detected', event.txHash, 0);
-
-    // Sponsor energy before the user's transfer confirms if the address needs it.
-    await sponsorIfNeeded(payment.address, payment.id);
-
-    break; // Only process the first qualifying transfer per poll cycle.
+  // Sufficient balance — payment received.
+  // Try to retrieve the inbound tx hash from the event log (best-effort).
+  let txHash = '';
+  try {
+    const sinceTs = lastPolledAt.get(payment.address) ?? new Date(payment.created_at).getTime();
+    const events  = await getTransferEvents(payment.address, sinceTs);
+    txHash = events[0]?.txHash ?? '';
+  } catch {
+    // Non-fatal — tx hash is for display only; forwarding doesn't need it.
   }
+  lastPolledAt.set(payment.address, Date.now() - 60_000);
+
+  console.log(`[monitor] Payment ${payment.id} detected. Balance: ${balance} USDT. TX: ${txHash || '(lookup pending)'}`);
+
+  updatePaymentStatus(payment.id, 'detected', txHash || undefined, 0);
+  await sponsorIfNeeded(payment.address, payment.id);
 }
 
 /**
@@ -220,18 +233,51 @@ async function checkForIncomingTransfer(payment: Payment): Promise<void> {
  * confirmations ≈ 9 seconds after detection).
  */
 async function checkConfirmations(payment: Payment): Promise<void> {
-  if (!payment.tx_hash) return;
+  let txHash = payment.tx_hash;
 
+  // If tx_hash is missing (common for unactivated addresses where TronGrid
+  // returns no event data), try to look it up via the transfer event log.
+  if (!txHash) {
+    try {
+      const sinceTs = payment.detected_at
+        ? new Date(payment.detected_at).getTime() - 30_000
+        : new Date(payment.created_at).getTime();
+      const events = await getTransferEvents(payment.address, sinceTs);
+      if (events.length > 0) {
+        txHash = events[0].txHash;
+        updatePaymentStatus(payment.id, 'detected', txHash, undefined);
+        console.log(`[monitor] Resolved tx_hash for ${payment.id}: ${txHash}`);
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // If still no tx_hash but the payment has been in 'detected' state for >30s
+  // (≥10 TRON blocks), the balance was already verified by getBalance() and
+  // enough blocks have passed. Proceed to forwarding without the hash.
+  if (!txHash) {
+    const detectedMs = payment.detected_at
+      ? Date.now() - new Date(payment.detected_at).getTime()
+      : 0;
+    if (detectedMs > 30_000) {
+      console.log(
+        `[monitor] Payment ${payment.id}: tx_hash unavailable after ${Math.round(detectedMs / 1000)}s` +
+        ` — balance verified, proceeding to forward.`,
+      );
+      await handleConfirmed(payment);
+    }
+    return;
+  }
+
+  // Normal path: count confirmations via block height comparison.
   try {
     const tronGridUrl = process.env.TRON_RPC_URL ?? 'https://api.trongrid.io';
     const headers: Record<string, string> = {};
     if (process.env.TRON_API_KEY) headers['TRON-PRO-API-KEY'] = process.env.TRON_API_KEY;
 
-    // Fetch transaction info to get the block number it was included in.
     const [txInfoRes, blockRes] = await Promise.all([
       axios.post(
         `${tronGridUrl}/wallet/gettransactioninfobyid`,
-        { value: payment.tx_hash },
+        { value: txHash },
         { headers, timeout: 5000 },
       ),
       axios.post(
@@ -245,7 +291,6 @@ async function checkConfirmations(payment: Payment): Promise<void> {
     const currentBlock: number =
       blockRes.data?.block_header?.raw_data?.number ?? 0;
 
-    // Fallback: if the tx isn't in a block yet, keep current count.
     if (txBlockNumber === 0) return;
 
     const confirmations = Math.max(0, currentBlock - txBlockNumber);
@@ -255,7 +300,6 @@ async function checkConfirmations(payment: Payment): Promise<void> {
       await handleConfirmed(payment);
     }
   } catch (err) {
-    // Non-fatal — the next poll cycle will retry.
     console.warn(`[monitor] checkConfirmations(${payment.id}) failed:`, err);
   }
 }

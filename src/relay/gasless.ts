@@ -21,7 +21,7 @@
  *   warning and re-sponsors.
  */
 
-import { checkNeedsSponsorship, sponsorEnergy } from '../wallet/tronGasfree';
+import { checkNeedsSponsorship, sponsorEnergy, activateIfNeeded } from '../wallet/tronGasfree';
 
 export interface SponsorshipResult {
   needed: boolean;
@@ -56,6 +56,11 @@ export async function sponsorIfNeeded(
   address: string,
   paymentId: string,
 ): Promise<SponsorshipResult> {
+  // Ensure the address is activated before attempting energy sponsorship.
+  // Unactivated addresses cannot broadcast transactions; activation requires
+  // at least one inbound TRX transfer to create the account on-chain.
+  await activateIfNeeded(address);
+
   const needed = await checkNeedsSponsorship(address);
 
   if (!needed) {
