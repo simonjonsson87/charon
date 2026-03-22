@@ -43,6 +43,7 @@ import { releaseAddress } from './addressPool';
 import { sponsorIfNeeded } from './gasless';
 import { activateIfNeeded } from '../wallet/tronGasfree';
 import { deliverWebhook } from './webhook';
+import { recordTransaction } from '../monitoring/metrics';
 import type { Payment } from '../db/schema';
 
 const REQUIRED_CONFIRMATIONS = 3;
@@ -357,6 +358,10 @@ async function handleTronPayout(
     );
     updatePaymentStatus(payment.id, 'forwarded', txHash, REQUIRED_CONFIRMATIONS);
     console.log(`[monitor] Payment ${payment.id} forwarded on Tron. TX: ${txHash}`);
+    const confirmSecs = payment.detected_at
+      ? (Date.now() - new Date(payment.detected_at).getTime()) / 1000
+      : 0;
+    recordTransaction(payment.id, payment.amount_due, '0', confirmSecs);
     deliverWebhook(payment, developer).catch((err) => {
       console.error(`[monitor] Webhook delivery failed for payment ${payment.id}:`, err);
     });
@@ -413,6 +418,10 @@ async function checkBridgeStatus(payment: Payment): Promise<void> {
     if (order.status === 'fulfilled') {
       updatePaymentStatus(payment.id, 'forwarded', payment.tx_hash, REQUIRED_CONFIRMATIONS);
       console.log(`[monitor] Payment ${payment.id} bridge fulfilled. orderId: ${payment.tx_hash}`);
+      const confirmSecs = payment.detected_at
+        ? (Date.now() - new Date(payment.detected_at).getTime()) / 1000
+        : 0;
+      recordTransaction(payment.id, payment.amount_due, '0', confirmSecs);
 
       const developer = getDeveloperById(payment.developer_id);
       if (developer) {

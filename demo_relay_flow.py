@@ -60,6 +60,17 @@ import time
 from pathlib import Path
 
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Monkey-patch requests so every call uses verify=False.
+# Needed on macOS Python 3.8 which doesn't trust the CA chain used by
+# Akash / DigitalFrontier ingress TLS certificates.
+_orig_request = requests.Session.request
+def _no_verify_request(self, method, url, **kwargs):
+    kwargs.setdefault('verify', False)
+    return _orig_request(self, method, url, **kwargs)
+requests.Session.request = _no_verify_request
 
 # Load .env from the same directory as this script (same file Node.js uses)
 try:
@@ -125,7 +136,8 @@ def die(msg: str) -> None:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-SERVER       = os.environ.get("SERVER_URL",      "http://localhost:3000").rstrip("/")
+#SERVER       = os.environ.get("SERVER_URL",      "http://localhost:3000").rstrip("/")
+SERVER       = os.environ.get("SERVER_URL",      "https://m1fsa7tb7pehje3tt182r27cek.ingress.h4i-dedicated.eu-sw-2.digitalfrontier.so").rstrip("/")
 PAYOUT_ADDR  = os.environ.get("PAYOUT_ADDRESS",  "TPL3f1Qe2dfTp9iLPgeLuQEqPAnBPhBHQJ")
 WEBHOOK_URL  = os.environ.get("WEBHOOK_URL",     "https://webhook.site/998ec698-c197-491c-bf0a-e7524656a984")
 AMOUNT       = os.environ.get("PAYMENT_AMOUNT",  "1.00")

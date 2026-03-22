@@ -149,9 +149,9 @@ export function getDailyMetrics(date: string): MetricsDaily | null {
 /**
  * getRollingMetrics — Aggregated metrics over the last N days.
  *
- * Returns totals (revenue, transaction count, LLM cost) and averages
- * (confirmation time, daily transaction rate) for use in the board meeting
- * context and the agent's runway calculation.
+ * Combines persisted daily rollups from the DB with the current in-memory
+ * accumulator so that today's transactions appear immediately without waiting
+ * for the 23:55 rollup cron.
  */
 export function getRollingMetrics(days: number): {
   totalRevenueUsdt: number;
@@ -164,10 +164,14 @@ export function getRollingMetrics(days: number): {
   totalAaveYieldUsdt: number;
   periodDays: number;
 } {
+  ensureAccumulatorDate();
+
   const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
     .toISOString()
     .split('T')[0];
 
+  // Query persisted rows, excluding today (the in-memory accumulator covers today).
+  const today = todayDate();
   const row = db.prepare(`
     SELECT
       SUM(CAST(revenue_usdt AS REAL))       AS total_revenue_usdt,
@@ -179,8 +183,8 @@ export function getRollingMetrics(days: number): {
       SUM(CAST(aave_yield_usdt AS REAL))    AS total_aave_yield_usdt,
       COUNT(*)                              AS day_count
     FROM metrics_daily
-    WHERE date >= ?
-  `).get(cutoff) as {
+    WHERE date >= ? AND date < ?
+  `).get(cutoff, today) as {
     total_revenue_usdt: number;
     total_revenue_usdc: number;
     total_transactions: number;
@@ -191,18 +195,36 @@ export function getRollingMetrics(days: number): {
     day_count: number;
   };
 
-  const totalTx = row.total_transactions ?? 0;
-  const dayCount = Math.max(row.day_count ?? 1, 1);
+  // Add today's in-memory accumulator on top of the historical DB rows.
+  const totalRevenueUsdt = (row.total_revenue_usdt ?? 0) + accumulator.revenueUsdt;
+  const totalRevenueUsdc = (row.total_revenue_usdc ?? 0) + accumulator.revenueUsdc;
+  const totalTransactions = (row.total_transactions ?? 0) + accumulator.transactionCount;
+  const totalLlmCalls     = (row.total_llm_calls ?? 0)   + accumulator.llmCalls;
+  const totalLlmCostUsd   = (row.total_llm_cost_usd ?? 0) + accumulator.llmCostUsd;
+  const totalAaveYield    = (row.total_aave_yield_usdt ?? 0) + accumulator.aaveYieldUsdt;
+
+  // Confirmation time: weighted average of historical avg + today's running sum.
+  const historicalConfSec = row.avg_confirmation_seconds ?? 0;
+  const historicalConfN   = row.day_count ?? 0;
+  const todayAvgConf = accumulator.confirmationSecondsCount > 0
+    ? accumulator.confirmationSecondsSum / accumulator.confirmationSecondsCount
+    : 0;
+  const avgConfirmationSeconds = (historicalConfN + (todayAvgConf > 0 ? 1 : 0)) > 0
+    ? (historicalConfSec * historicalConfN + todayAvgConf) / (historicalConfN + (todayAvgConf > 0 ? 1 : 0))
+    : 0;
+
+  // Day count includes today if it has any activity.
+  const dayCount = Math.max((row.day_count ?? 0) + 1, 1);
 
   return {
-    totalRevenueUsdt: row.total_revenue_usdt ?? 0,
-    totalRevenueUsdc: row.total_revenue_usdc ?? 0,
-    totalTransactions: totalTx,
-    avgDailyTransactions: totalTx / dayCount,
-    avgConfirmationSeconds: row.avg_confirmation_seconds ?? 0,
-    totalLlmCalls: row.total_llm_calls ?? 0,
-    totalLlmCostUsd: row.total_llm_cost_usd ?? 0,
-    totalAaveYieldUsdt: row.total_aave_yield_usdt ?? 0,
+    totalRevenueUsdt,
+    totalRevenueUsdc,
+    totalTransactions,
+    avgDailyTransactions: totalTransactions / dayCount,
+    avgConfirmationSeconds,
+    totalLlmCalls,
+    totalLlmCostUsd,
+    totalAaveYieldUsdt: totalAaveYield,
     periodDays: days,
   };
 }

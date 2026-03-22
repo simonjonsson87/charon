@@ -255,16 +255,29 @@ async function sponsorViaTronSave(
   energy: number,
 ): Promise<{ success: boolean; trxCost: string }> {
   try {
-    // TronSave API: POST /v2/energy/buy
+    // TronSave API v2: POST /v2/buy-resource
+    // (old /v2/energy/buy endpoint was removed)
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (process.env.TRONSAVE_API_KEY) headers['apikey'] = process.env.TRONSAVE_API_KEY;
+
     const res = await axios.post(
-      'https://api.tronsave.io/v2/energy/buy',
-      { address, energy },
-      { timeout: 15_000 },
+      'https://api.tronsave.io/v2/buy-resource',
+      {
+        resourceType: 'ENERGY',
+        unitPrice: 'MEDIUM',
+        resourceAmount: energy,
+        receiver: address,
+        durationSec: 3600,
+        options: { allowPartialFill: true },
+      },
+      { headers, timeout: 15_000 },
     );
 
-    const costTrx = parseFloat(res.data?.price_trx ?? res.data?.cost ?? '0');
-    console.log(`[wallet/tronGasfree] TronSave sponsor: ${costTrx} TRX for ${energy} energy.`);
-    return { success: true, trxCost: costTrx.toFixed(6) };
+    // Success is HTTP 201; orderId is in data.data.orderId
+    const orderId = res.data?.data?.orderId ?? res.data?.orderId ?? '';
+    console.log(`[wallet/tronGasfree] TronSave sponsor order placed for ${energy} energy. orderId: ${orderId}`);
+    // TronSave doesn't return TRX cost in the order response — return 0 as placeholder.
+    return { success: true, trxCost: '0' };
   } catch (err) {
     console.error('[wallet/tronGasfree] TronSave sponsor failed, falling back to burn:', err);
     return sponsorViaBurn(address, energy);
