@@ -196,8 +196,19 @@ export async function activateIfNeeded(address: string): Promise<boolean> {
     const tx = await signerWeb.trx.sendTransaction(address, 1_000_000);
     if (tx.result) {
       console.log(`[wallet/tronGasfree] Activation TX sent for ${address}: ${tx.txid}`);
-      // Wait one block (~3s) for activation to land before energy delegation.
-      await new Promise((r) => setTimeout(r, 3500));
+      // Poll until the account is confirmed active on-chain (up to 15s / 5 blocks).
+      // A fixed 3.5s sleep is not reliable — TronSave does its own activation
+      // check and will reject with RECEIVER_ADDRESS_NOT_ACTIVE if we call too early.
+      for (let i = 0; i < 5; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const check = await tronWeb.trx.getAccount(address);
+        if (check && Object.keys(check).length > 0) {
+          console.log(`[wallet/tronGasfree] Address ${address} confirmed active after ${(i + 1) * 3}s.`);
+          return true;
+        }
+      }
+      // Activation TX was broadcast but account not yet visible — proceed anyway.
+      console.warn(`[wallet/tronGasfree] Activation TX sent but account not yet visible after 15s for ${address}. Proceeding.`);
       return true;
     }
 
