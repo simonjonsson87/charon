@@ -248,6 +248,15 @@ export async function sponsorEnergy(
     `[wallet/tronGasfree] Sponsoring ${estimatedEnergy} energy for ${address} via ${provider}.`,
   );
 
+  // TronSave and TR.ENERGY are mainnet-only services — they check activation
+  // on mainnet and will reject any Shasta testnet address. Fall back to burn
+  // when running against Shasta.
+  const isTestnet = tronGridUrl.includes('shasta') || tronGridUrl.includes('nile');
+  if (isTestnet) {
+    console.log('[wallet/tronGasfree] Testnet detected — skipping rental providers, using burn.');
+    return sponsorViaBurn(address, estimatedEnergy);
+  }
+
   if (provider === 'tronsave') {
     return sponsorViaTronSave(address, estimatedEnergy);
   } else if (provider === 'trenergy') {
@@ -289,8 +298,11 @@ async function sponsorViaTronSave(
     console.log(`[wallet/tronGasfree] TronSave sponsor order placed for ${energy} energy. orderId: ${orderId}`);
     // TronSave doesn't return TRX cost in the order response — return 0 as placeholder.
     return { success: true, trxCost: '0' };
-  } catch (err) {
-    console.error('[wallet/tronGasfree] TronSave sponsor failed, falling back to burn:', err);
+  } catch (err: unknown) {
+    const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message
+      ?? (err as { message?: string })?.message
+      ?? String(err);
+    console.warn(`[wallet/tronGasfree] TronSave sponsor failed (${msg}), falling back to burn.`);
     return sponsorViaBurn(address, energy);
   }
 }

@@ -136,8 +136,8 @@ def die(msg: str) -> None:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-#SERVER       = os.environ.get("SERVER_URL",      "http://localhost:3000").rstrip("/")
-SERVER       = os.environ.get("SERVER_URL",      "https://43adl6do9pf7far4egu4tap9rs.ingress.jjozzietech.com.au").rstrip("/")
+SERVER       = os.environ.get("SERVER_URL",      "http://localhost:3000").rstrip("/")
+#SERVER       = os.environ.get("SERVER_URL",      "https://43adl6do9pf7far4egu4tap9rs.ingress.jjozzietech.com.au").rstrip("/")
 PAYOUT_ADDR  = os.environ.get("PAYOUT_ADDRESS",  "TCpm6dDPsYk1KgXy8i66aGDwHi1mviEhxb")
 WEBHOOK_URL  = os.environ.get("WEBHOOK_URL",     "https://webhook.site/998ec698-c197-491c-bf0a-e7524656a984")
 AMOUNT       = os.environ.get("PAYMENT_AMOUNT",  "1.00")
