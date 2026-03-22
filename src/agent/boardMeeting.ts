@@ -399,7 +399,7 @@ function computeGasEstimates(
  * The prompt tells the agent what it needs to assess. The context object
  * is injected separately by runAgentSession().
  */
-function buildBoardMeetingPrompt(context: Record<string, unknown>): string {
+export function buildBoardMeetingPrompt(context: Record<string, unknown>): string {
   void context; // context is injected as structured JSON alongside this message
   return `
 # Daily Board Meeting — ${new Date().toISOString().replace('T', ' ').split('.')[0]} UTC

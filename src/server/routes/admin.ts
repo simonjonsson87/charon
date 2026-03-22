@@ -25,7 +25,7 @@ import { getLogs, dbLog } from '../../db/logger';
 import type { LogCategory } from '../../db/logger';
 import { checkAll } from '../../monitoring/anomaly';
 import { handleAnomaly } from '../../agent/decisionLayer';
-import { runBoardMeeting, assembleBoardMeetingContext } from '../../agent/boardMeeting';
+import { runBoardMeeting, assembleBoardMeetingContext, buildBoardMeetingPrompt } from '../../agent/boardMeeting';
 import type { AnomalyType } from '../../monitoring/anomaly';
 
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY ?? '';
@@ -100,7 +100,17 @@ export async function adminRoutes(
    */
   fastify.get('/status', async () => {
     const context = await assembleBoardMeetingContext();
-    return { ...context, uptime: process.uptime() };
+    const boardMeetingPrompt = buildBoardMeetingPrompt(context);
+    return {
+      ...context,
+      uptime: process.uptime(),
+      boardMeetingParcel: {
+        agent: 'board-meeting',
+        thinking: 'high',
+        message: boardMeetingPrompt,
+        context,
+      },
+    };
   });
 
   // ---- POST /admin/board-meeting -------------------------------------------

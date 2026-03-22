@@ -132,9 +132,13 @@ async function pollPayments(): Promise<void> {
       if (!lastPolledAt.has(payment.address)) {
         lastPolledAt.set(payment.address, new Date(payment.created_at).getTime());
         const contract = process.env.TRON_USDT_CONTRACT ?? 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+        const rpc = process.env.TRON_RPC_URL ?? 'https://api.trongrid.io';
         console.log(
-          `[monitor] Now watching ${payment.address} for ≥${payment.amount_due} USDT` +
-          ` (contract: ${contract}) — payment ${payment.id}`,
+          `[monitor] Waiting for payment of ${payment.amount_due} USDT` +
+          ` to ${payment.address}` +
+          ` for token ${contract}` +
+          ` using RPC ${rpc}` +
+          ` — payment ${payment.id}`,
         );
         // Proactively activate the address so it can broadcast transactions when
         // it's time to forward. Unactivated addresses can't sign TXs. Firing now
@@ -351,6 +355,15 @@ async function handleTronPayout(
   developer: import('../db/schema').Developer,
 ): Promise<void> {
   try {
+    // Activate the destination address if it doesn't exist on-chain yet.
+    // On Shasta, TRC-20 transfers to unactivated addresses fail with
+    // "account does not exist". On mainnet this is usually not needed but
+    // activateIfNeeded is a no-op if the address is already active.
+    const activated = await activateIfNeeded(developer.receiving_address);
+    if (!activated) {
+      console.warn(`[monitor] Could not activate destination ${developer.receiving_address} — proceeding anyway.`);
+    }
+
     const txHash = await forwardPayment(
       payment.address_index,
       developer.receiving_address,
