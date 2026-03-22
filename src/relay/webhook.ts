@@ -136,8 +136,11 @@ async function attemptDelivery(
     console.log(`[webhook] Delivered (attempt ${attempt}). Status: ${response.status}`);
     return true;
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.warn(`[webhook] Delivery attempt ${attempt} failed: ${message}`);
+    const e = err as { message?: string; code?: string; response?: { status: number } };
+    const message = e.message || '(no message)';
+    const code = e.code ? ` [${e.code}]` : '';
+    const status = e.response ? ` HTTP ${e.response.status}` : '';
+    console.warn(`[webhook] Delivery attempt ${attempt} failed to ${url}: ${message}${code}${status}`);
     return false;
   }
 }
